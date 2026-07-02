@@ -25,8 +25,8 @@ metadata:
 
 # Anti-Slop
 
-Active counterpart to the `stop` hook's final-review (`final-review.ps1` /
-`.sh`). The review only *advises* — it asks the model to apply this checklist to
+Active counterpart to the `stop` hook's final-review (`final-review.mjs`).
+The review only *advises* — it asks the model to apply this checklist to
 the session diff; this skill does a deliberate sweep that **removes** the slop.
 Same detectors — but here you fix, you don't flag.
 
@@ -225,8 +225,7 @@ management*, not token volume — one source of truth per concept.
 
 ## Automatic final review
 
-The `stop` hook (`~/.agents/hooks/final-review.ps1` on Windows,
-`~/.agents/hooks/final-review.sh` on Linux) fires after the agent finishes an
+The `stop` hook (`~/.agents/hooks/final-review.mjs`) fires after the agent finishes an
 implementation that edited files. It extracts the last `<user_query>` from the
 session transcript (Tier 0 intent trace), reports session footprint (Tier 5),
 and auto-submits a `followup_message` so the model audits eight axes: 0 intent,
@@ -268,11 +267,11 @@ Diff: {before} → {after} lines.   Tests: {pass | n/a}
 | Install path | `~/.cursor/skills/anti-slop/` |
 | Invoke | `/anti-slop`, or "remove the AI slop" |
 | Scanner | `python scripts/scan_slop.py --all` |
-| Final review | automatic via `stop` hook (`final-review.ps1` / `final-review.sh`) |
+| Final review | automatic via `stop` hook (`final-review.mjs`) |
 | Hook checklist | `~/.agents/hooks/anti-slop.md` (40 items; final-review axis 4) |
 
 The scanner is stdlib-only and needs Python 3.9+. It pairs with the shipped
-hook pack: the **stop hook** (`final-review.ps1` / `.sh`) runs an eight-axis
+hook pack: the **stop hook** (`final-review.mjs`) runs an eight-axis
 session review whose anti-slop axis (4) points the model at this skill's
 checklist (`anti-slop.md`) and runs the scanner scoped to the changed files;
 **scope-refresh** (`afterFileEdit`) records every edited file into `.scope.json`

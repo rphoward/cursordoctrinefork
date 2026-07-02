@@ -1,7 +1,7 @@
 # Hooks — operational reference
 
-Ten agent hooks plus `inject-doctrine` across seven events. The `hooks.json` files (`windows/`, `linux/`) are
-spec-clean: only the documented Cursor options (`command`, `timeout`,
+Ten agent hooks plus `inject-doctrine` across seven events. The single `hooks.json`
+is spec-clean: only the documented Cursor options (`command`, `timeout`,
 `loop_limit`, `failClosed`, `matcher`). Aligns with https://cursor.com/docs/hooks.
 
 Kill switches: any hook no-ops when `HOOKS_ENFORCE=0`; each also has its own
@@ -11,7 +11,7 @@ Kill switches: any hook no-ops when `HOOKS_ENFORCE=0`; each also has its own
 The final-review brake state lives under `~/.cursor/.hooks-pending/`, keyed by
 `conversation_id`. Never committed.
 
-## beforeSubmitPrompt — intent-precompile (.ps1/.sh)
+## beforeSubmitPrompt — intent-precompile (.mjs)
 5s. Fires right after the user hits send, BEFORE the agent's first token, with
 the prompt in the payload directly. Writes the prompt as `.scope.json`'s
 `prompt` field (hook-owned). Agent owns `intent` (Step 0 restatement),
@@ -45,12 +45,12 @@ If `.scope.json` doesn't exist, creates it fresh with empty `intent`,
 auto-submits (FINAL REVIEW / SCOPE REMINDER / VERIFY MILESTONE / etc.). Never
 blocks. No repo root → silent. Disable: `INTENT_PRECOMPILE_ENFORCE=0`.
 
-## sessionStart — inject-doctrine (.ps1/.sh)
+## sessionStart — inject-doctrine (.mjs)
 5s. Reads `~/.cursor/doctrine.md` and emits it as `{"additional_context": ...}`
 (sessionStart does NOT consume raw stdout). This is the session-scoped system
 context — the only governing text the agent receives. Short on purpose.
 
-## preToolUse — step0-gate (.ps1/.sh)
+## preToolUse — step0-gate (.mjs)
 5s, `failClosed: false`, matcher `Write|StrReplace|ApplyPatch|Edit|MultiEdit|Replace`. Hard Step 0
 enforcement — the second non-advisory lever (beside `permission-gate`).
 
@@ -68,19 +68,23 @@ switch set. Read/Grep/Shell are not matched — explore first, contract second.
 Emits `{"permission":"deny","user_message":...,"agent_message":...}`. Disable:
 `STEP0_GATE_ENFORCE=0`.
 
-## afterFileEdit — scope-refresh (.ps1/.sh)
-5s. Reads `.scope.json` from the repo root and stashes a
-one-line reminder (`prompt` / `intent` / `files` / `acceptance`) to
-`~/.cursor/.hooks-pending/scope-<cid>.txt`. Cursor does not consume
+## afterFileEdit — scope-refresh (.mjs)
+5s. Reads `.scope.json` from the repo root and stashes a token-lean reminder
+to `~/.cursor/.hooks-pending/scope-<cid>.txt`. Cursor does not consume
 afterFileEdit output directly, so the stash is delivered by `scope-drain`
 (postToolUse, fires next). Per-edit re-injection against Salience Dilution:
-keeps the contract visible as a turn fills with code. Silent when no
-`.scope.json` exists (trivial edits, fresh repos). One state file, no hashes,
-no latches. No matcher — fires on ALL file edits (Write, Edit, MultiEdit,
+keeps the contract visible as a turn fills with code.
+
+Token economy: the verbatim `prompt` is never included (already in the
+conversation); `files[]` is a count + the just-edited path, not the full list.
+The full `intent`/`acceptance` text is stashed only when it changed since the
+last delivery (compared against `scope-sig-<cid>.txt`); an unchanged contract
+gets a one-liner. Silent when no `.scope.json` exists (trivial edits, fresh
+repos). No matcher — fires on ALL file edits (Write, Edit, MultiEdit,
 ApplyPatch, etc.), not just `Write`. Saved Cursor plans under
 `.cursor/plans/**` are ignored. Disable: `SCOPE_REFRESH_ENFORCE=0`.
 
-## postToolUse — scope-drain + scope-git-sweep + milestone-verify + intent-anchor (.ps1/.sh)
+## postToolUse — scope-drain + scope-git-sweep + milestone-verify + intent-anchor (.mjs)
 5s each. Four entries run in array order.
 
 **scope-drain:** Drains the per-cid `scope-<cid>.txt` stash (written by
@@ -98,19 +102,21 @@ timestamp (written at `sessionStart` by `inject-doctrine` and on first prompt by
 **milestone-verify (doctrine-ultra):** Tri-role Verifier. When `.scope.json`
 declares a non-empty `decomposition[]` AND a step's `expected_files[]` are all
 in `files[]` AND no verdict is recorded for that step in `verifications[]`,
-emit `VERIFY MILESTONE step N of M` as `additional_context`. The agent emits
+emit `VERIFY MILESTONE step N of M` as `additional_context` (compact: subtask
++ expected-file count; the file list lives in `.scope.json`). The agent emits
 `ACCEPT step N` or `REVISE step N: <one-line diagnosis>` in chat; the hook
 scrapes the transcript backward through assistant turns for the most recent
 verdict and writes it into `verifications[]` (hook-owned).
 
 Silent when: `.scope.json` missing; all steps already verified; no
-expected_files completed; kill switch set; (Linux) no python3 available
+expected_files completed; kill switch set; no python available
 (verdict-scrape needs regex on transcript text). When `decomposition[]` is
 empty BUT the session has touched >= 2 files, a `DECOMPOSE` nudge fires
 instead of going silent: the doctrine requires decomposition for multi-file
 tasks, and this closes the gap where an agent touches many files with zero
 steps declared. Per-cid flag throttle (mirrors intent-anchor) re-nudges only
-when `files[]` grows, capped at 99999 (env override `DECOMPOSE_NUDGE_CAP`). The
+when `files[]` grows, capped at 99999 (env override `DECOMPOSE_NUDGE_CAP`).
+Token economy: the first nudge explains; re-nudges are one line. The
 final review's axis 7 is the backstop: a multi-file task with no decomposition
 FAILs. Never blocks. Disable: `MILESTONE_VERIFY_ENFORCE=0`.
 
@@ -122,22 +128,23 @@ stores `filesCount:nudgeCount`. Once both `intent` and sharpened `acceptance`
 are filled, the hook goes silent permanently for that conversation. The nudge
 cap is 99999 per conversation (env override `INTENT_ANCHOR_NUDGE_CAP`); the
 final review's axis 0 FAIL is the backstop at stop time. Emits an `INTENT ANCHOR`
-reminder listing which agent-owned field is missing. The hook never writes
-those fields — it just surfaces the gap so final-review's axis 0 intent trace
-has something better than the raw prompt to work with. Disable:
-`INTENT_ANCHOR_ENFORCE=0`.
+reminder listing only the missing agent-owned fields (no verbatim prompt — it
+is already in the conversation). Token economy: the first nudge explains;
+re-nudges are one line. The hook never writes those fields — it just surfaces
+the gap so final-review's axis 0 intent trace has something better than the
+raw prompt to work with. Disable: `INTENT_ANCHOR_ENFORCE=0`.
 
-## beforeShellExecution — permission-gate (.ps1/.sh)
+## beforeShellExecution — permission-gate (.mjs)
 5s, `failClosed: false`. Deny a small explicit list of dangerous commands
 (`rm -rf` on absolute paths, `curl|sh`, force-push, `npm publish`, ...).
 Default-allow, deny-by-list. Emits canonical
 `{"permission":"allow"|"deny","user_message":...}`. The script itself fails
 open on parse/runtime errors. `failClosed: false` matches that: if Cursor's
-hook runner aborts pwsh before the script returns (cold-start timeout, signal),
+hook runner aborts node before the script returns (cold-start timeout, signal),
 shell is not blocked. Set `failClosed: true` in your merged `hooks.json` only
 if you prefer deny-on-timeout over availability.
 
-## stop — final-review (.ps1/.sh)
+## stop — final-review (.mjs)
 30s, `loop_limit: 3`. ONE comprehensive end-of-implementation review across
 eight axes (0 intent trace, 1 correctness, 2 reliability, 3 coverage, 4
 anti-slop, 5 wiring completeness, 6 mechanics, 7 role-trace if
@@ -170,6 +177,13 @@ verify-revise-reverify cycle: review, fix, re-review until the diff
 stabilizes. Bounded by `loop_limit: 3` (review, revise, re-review).
 Orphaned flags from a missed follow-up are cleared and review re-fires.
 Only fires on `status === 'completed'`.
+
+Token economy: a re-review (brake re-fire or `loop_count > 0`) does NOT
+re-send the full review template — the model read it one turn earlier in the
+same conversation. It emits a compact `FINAL REVIEW (re-review)` instruction
+plus fresh evidence blocks. The `ORIGINAL REQUEST` trace is capped at 600
+chars (prompt-as-source at 300) and the changed-file list at 15 entries; the
+full list lives in `.scope.json` `files[]`.
 
 Intent trace: pulls `intent` from `.scope.json` (agent restatement), quotes
 `prompt` as source when both exist, else falls back to the last human

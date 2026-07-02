@@ -50,22 +50,28 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
-from collections import Counter, defaultdict
+from collections import Counter
 from itertools import islice
 from typing import Any
 
+_SCRIPT_DIR = re.sub(r"[\\/][^\\/]+$", "", __file__) or "."
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+from _language import (
+    ID, lang_of, _strip_comments, _mask_strings,
+)
+from _duplication import (
+    BODY_CAP, collect_defs, collect_types, analyze_duplication, dup_has_findings,
+)
+
 Finding = dict[str, Any]
 
-# ---- per-file signal patterns -------------------------------------------
-# Only manifest formats the DEP regex genuinely parses (name [:=@] version).
-# go.mod / pom.xml / Gradle / Gemfile / .csproj declare deps in syntaxes DEP
-# cannot match, so listing them would only over-claim coverage.
 MANIFEST = re.compile(
     r"^(package\.json|requirements[\w.\-]*\.txt|pyproject\.toml|Pipfile"
     r"|Cargo\.toml|composer\.json)$"
@@ -74,9 +80,6 @@ DEP = re.compile(
     r"""(?:^|[{,])\s*(?:"|')?(?P<name>[A-Za-z@][\w@\-./\[\]]*)(?:"|')?\s*"""
     r"""(?:[:=]\s*(?:"|')?[\^~><=*v]?\d|[><=~!]=\s*\d|@\s*\^?\d)"""
 )
-# Manifest metadata that pairs a name with a version-looking value without
-# declaring a dependency. Skipped only at line start: `serde = { version = ...`
-# matches mid-line and IS a real dependency.
 META_KEYS = frozenset({
     "version", "name", "node", "npm", "yarn", "pnpm", "packagemanager",
     "engines", "python", "private", "description",
@@ -86,8 +89,6 @@ ABSTRACTION = re.compile(
     r"([A-Z][A-Za-z0-9_]*(?:Factory|Repository|Mediator|Strategy|Singleton"
     r"|Facade|Builder|Visitor|Decorator|Wrapper|Orchestrator|Registry))\b"
 )
-# [C]QRS: the brackets change nothing semantically but keep the alternative
-# from matching its own definition when the scanner audits itself.
 VOCAB = re.compile(
     r"\b([C]QRS|Event[\s\-]?Sourc(?:e|ing)|Domain[\s\-]?Driven|Aggregate\s?Root"
     r"|Bounded\s?Context|Hexagonal\s+Architecture|Onion\s+Architecture)\b",
@@ -101,28 +102,17 @@ COMMENT = re.compile(
     re.I,
 )
 _CMT_MARKER = re.compile(r"^\s*(?://+|#+|/\*+|\*+)\s*")
-# ---- residue / type-escape / swallow / tautology signals -----------------
-# Failure classes these seed: AI-Specific (prompt residue), Type-System
-# (any-driven development), Defensive Code Inflation (swallowed errors) and
-# Testing (test theater). \s+ between words instead of literal spaces doubles
-# as robustness to spacing AND keeps each pattern from matching its own
-# source when the scanner audits itself.
 RESIDUE_PHRASE = re.compile(
     r"\bin\s+a\s+real\s+(?:app(?:lication)?|world|scenario)\b"
     r"|\bfor\s+production\s+use\b|\bthis\s+is\s+a\s+simplified\b"
     r"|\bTODO:?\s+implement\s+actual\b|\breplace\s+(?:this\s+)?with\s+your\b",
     re.I,
 )
-# = * # walls only: `# ----` section dividers are a long-standing human
-# convention (numpy, stdlib); `// =====` banners are the generated-code tell.
 RESIDUE_BANNER = re.compile(r"^\s*(?://|#|/\*)\s*[=*#]{5,}")
 RESIDUE_EMOJI = re.compile("[\u2600-\u27bf\U0001f300-\U0001faff]")
-# NOT @ts-expect-error: that one is the sanctioned, self-expiring form.
 TS_SUPPRESS = re.compile(r"@ts-(?:ignore|nocheck)\b")
 TS_ANY = re.compile(r"\bas\s+unknown\s+as\b|\bas\s+any\b|[,:<]\s*any\b|\bany\[\]")
 PY_TYPE_ESCAPE = re.compile(r"#\s*type:\s*ignore\b")
-# Only bare/broad swallows: `except ImportError: pass` is a legitimate idiom
-# (optional dependency); `except Exception: pass` hides every failure.
 _EXC_BROAD = r"^\s*except\b\s*(?:\(?\s*(?:Base)?Exception\s*\)?\s*(?:as\s+\w+\s*)?)?:"
 PY_SWALLOW = re.compile(_EXC_BROAD + r"\s*pass\b")
 PY_SWALLOW_HEAD = re.compile(_EXC_BROAD + r"\s*(?:#.*)?$")
@@ -138,19 +128,12 @@ JS_TAUTOLOGY = re.compile(
     r"|\bassert(?:True)?\(\s*true\s*\)"
 )
 PY_TAUTOLOGY = re.compile(r"^\s*assert\s+True\s*(?:$|[,#])|\bassertTrue\(\s*True\s*\)")
-# ---- framework failure modes (vibe-coding stack) --------------------------
-# await Promise.resolve() is always pointless; an async promise executor
-# swallows its own rejections.
 ASYNC_WRAPPER = re.compile(
     r"\bawait\s+Promise\s*\.\s*resolve\s*\(|\bnew\s+Promise\s*\(\s*async\b"
 )
-# A lone negated guard-return; chains where each test deepens the previous
-# (`!data` then `!data.user`) are the optional-chaining shape.
 GUARD_RETURN = re.compile(
     r"^\s*if\s*\(\s*!\s*([\w$][\w$.]*)\s*\)\s*(?:return|continue|break)\b[^;{}]*;?\s*$"
 )
-# Two adjacent literal booleans inside a call's argument list (Boolean Trap).
-# Bracket/brace exclusion keeps array literals like useState([true, false]) out.
 BOOL_PAIR_JS = re.compile(
     r"[\w$]\s*\(\s*[^()\[\]{}]*\b(?:true|false)\s*,\s*(?:true|false)\b"
 )
@@ -159,199 +142,27 @@ BOOL_PAIR_PY = re.compile(
 )
 SELECT_STAR = re.compile(r"\bSELECT\s+\*", re.I)
 TAILWIND_SOUP = re.compile(r"class(?:Name)?\s*=\s*[{]?\s*['\"`][^'\"`]{200,}")
-# Arbitrary >=100px values defeat the spacing scale (w-[347px] magic numbers).
 TAILWIND_MAGIC_PX = re.compile(r"-\[\d{3,}(?:\.\d+)?px\]")
-# Pure re-export indirection: `export * from './x'` or `export { a, b } from './x'`.
-# Does NOT match `export function`, `export const x = ...`, or local re-exports
-# (`export { foo }` without `from`) — only the case where the line ships nothing
-# of its own and just re-surfaces another module's exports. The "barrel that
-# earns its place" judgement stays with the model; the scanner flags the pattern.
 BARE_REEXPORT = re.compile(
     r"^\s*export\s+(?:\*(?:\s+as\s+\w+)?|\{[^}]*\})\s+from\s+['\"]"
 )
-# index.{ts,tsx,js,jsx,mjs,cjs} as the only file in a directory: the re-export
-# smell the cross-file duplication pass catches (a single-file dir whose only
-# occupant is an index module is almost always barrel indirection). Computed
-# once per --all scan from the file list; not a per-line regex.
-INDEX_FILE = re.compile(r"^index\.(ts|tsx|js|jsx|mjs|cjs)$", re.I)
 SOURCE = re.compile(
     r"\.(?:ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|kt|kts|cs|cpp|cc|cxx|c|h|hpp|rb"
     r"|php|swift|scala|m|mm|sh|ps1|lua|dart|ex|exs|vue|svelte|astro|html|sql)$"
 )
 CHECKLIST_LINES = 40
-READ_CAP = 4000   # lines read per file
-BODY_CAP = 80     # lines captured per function body
-FILE_CAP = 6000   # tracked files scanned in --all
-SHOW_CAP = 10     # findings printed per list (counts stay exact)
-
-# ---- duplication / clone machinery --------------------------------------
-ID = re.compile(r"[A-Za-z_$][\w$]*")
-TYPE_DECL = re.compile(r"\b(?:type|interface)\s+([A-Z][A-Za-z0-9_]*)\b")
-MICRO_PREFIX = re.compile(
-    r"^(?:is|has|can|should|assert|ensure|safe|to|from|get|set|make|create"
-    r"|parse|format|with|map|build|validate)[A-Z0-9]"
-)
-COMMON_NAMES = {
-    "render", "main", "default", "index", "setup", "run", "start", "stop",
-    "init", "handler", "handle", "callback", "loader", "action", "middleware",
-    "reducer", "app", "page", "layout", "constructor", "tostring", "tojson",
-    "valueof", "equals", "dispose", "close", "open", "connect", "get", "set",
-    "update", "create", "delete", "list", "find", "save", "load", "execute",
-    "process", "build", "test", "describe", "it", "expect", "beforeeach",
-    "aftereach", "beforeall", "afterall", "getstaticprops", "getserversideprops",
-    "getstaticpaths", "generatemetadata", "usestate", "useeffect", "wrapper",
-    "new", "string", "tostr", "clone", "copy", "value", "data", "result",
-    "componentdidmount", "componentwillunmount", "componentdidupdate",
-    "componentdidcatch", "getderivedstatefromerror", "getderivedstatefromprops",
-    "shouldcomponentupdate", "getsnapshotbeforeupdate", "ngoninit", "ngondestroy",
-    "connectedcallback", "disconnectedcallback",
-}
-# Common per-module type names - excluded from type-duplication reporting.
-COMMON_TYPES = frozenset({
-    "props", "state", "options", "option", "params", "parameters", "result",
-    "config", "configuration", "context", "ctx", "data", "item", "items",
-    "response", "request", "error", "react", "window", "ref", "children",
-    "theme", "style", "styles", "value", "values", "model", "entity", "dto",
-    "payload", "meta", "args", "arg", "input", "output", "node", "element",
-    "key", "id", "type", "types", "field", "fields", "row", "column", "event",
-    "handler", "callback", "fn", "cb",
-})
-FINGERPRINTS = {
-    "isrecord", "isobject", "isplainobject", "isdictionary", "isstring",
-    "isnumber", "isboolean", "isarraylike", "isnil", "isempty", "isdefined",
-    "ensurearray", "assertarray", "safeparse", "safeparsejson", "safejsonparse",
-    "sleep", "delay", "retry", "assertnever", "deepclone", "deepequal", "noop",
-    "clamp", "uniq", "unique", "capitalize", "classnames", "cn", "tryparse",
-}
-# Only genuine structural/control-flow keywords. Deliberately EXCLUDES words that
-# are commonly variable/method names in other languages (val, map, go, select,
-# ...) - masking those would break the structural hash (val stays val while value
-# becomes I -> false-negative near-dups).
-KEYWORDS = frozenset({
-    "if", "else", "elif", "for", "while", "do", "switch", "case", "default",
-    "break", "continue", "return", "function", "func", "fn", "def", "class",
-    "struct", "interface", "type", "trait", "impl", "enum", "const", "let",
-    "var", "new", "delete", "typeof", "instanceof", "in", "of", "is",
-    "as", "not", "and", "or", "null", "nil", "none", "None", "true", "false",
-    "True", "False", "undefined", "void", "this", "self", "super", "yield",
-    "await", "async", "try", "catch", "except", "finally", "throw", "raise",
-    "with", "public", "private", "protected", "static", "import",
-    "from", "export", "package", "lambda", "pass", "end",
-})
-# Class-method signature (JS/TS + best-effort C-style); names that are really
-# control flow are filtered out after match.
-METHOD_JS = re.compile(
-    r"^\s*(?:public\s+|private\s+|protected\s+|static\s+|readonly\s+|async\s+"
-    r"|get\s+|set\s+|override\s+|\*\s*)*([A-Za-z_$][\w$]*)\s*\([^;{]*\)\s*"
-    r"(?::\s*[^={;]+)?\s*\{"
-)
-METHOD_CSTYLE = re.compile(
-    r"^\s*(?:(?:public|private|protected|internal|static|final|virtual|override"
-    r"|abstract|async|sealed|unsafe)\s+)+[\w<>\[\].,?]+\s+([A-Za-z_]\w*)\s*"
-    r"\([^;{]*\)\s*(?:where[^{]+)?\{"
-)
-NOT_METHOD = {
-    "if", "for", "while", "switch", "catch", "return", "function", "do",
-    "else", "with", "await", "new", "delete", "void", "yield", "case",
-    "throw", "super", "typeof", "using", "lock", "fixed", "foreach",
-}
-EXPORT_KEYWORD = re.compile(r"\b(?:export|public|pub)\b")
-FUNC_PATTERNS = {
-    "js": [
-        re.compile(r"(?:^|\s)(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)\s*\("),
-        re.compile(r"(?:^|\s)(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>"),
-        METHOD_JS,
-    ],
-    "py": [re.compile(r"^\s*(?:async\s+)?def\s+([A-Za-z_]\w*)\s*\(")],
-    "go": [re.compile(r"^\s*func\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w*)\s*\(")],
-    "rust": [re.compile(r"\bfn\s+([A-Za-z_]\w*)\s*[(<]")],
-    "ruby": [re.compile(r"^\s*def\s+(?:self\.)?([A-Za-z_]\w*[!?=]?)")],
-    "php": [re.compile(r"\bfunction\s+([A-Za-z_]\w*)\s*\(")],
-    "cstyle": [METHOD_CSTYLE],
-}
-
-# ---- comment/string tokenization (language-aware, single pass) -----------
-# One combined regex per language family, string alternatives FIRST, so a //
-# or # inside a string literal can never be amputated as a comment, and an
-# unbalanced quote left by comment-stripping can never swallow real code.
-# Known line-based blind spots (accepted for zero deps): JS regex literals,
-# Rust lifetimes ('a), raw strings ending in a backslash.
-_STR_DQ = r'"(?:[^"\\\n]|\\.)*"'
-_STR_SQ = r"'(?:[^'\\\n]|\\.)*'"
-_STR_BT = r"`(?:[^`\\]|\\.)*`"
-_STR_TRIPLE = r"'''(?s:.*?)'''|\"\"\"(?s:.*?)\"\"\""
-_CMT_SLASH = r"//[^\n]*"
-_CMT_HASH = r"#[^\n]*"
-_CMT_BLOCK = r"/\*(?s:.*?)\*/"
-_FAMILY_SYNTAX = {
-    # family: (string alternatives, comment alternatives)
-    "py":   (f"{_STR_TRIPLE}|{_STR_DQ}|{_STR_SQ}", _CMT_HASH),
-    "ruby": (f"{_STR_DQ}|{_STR_SQ}", _CMT_HASH),
-    "php":  (f"{_STR_DQ}|{_STR_SQ}", f"{_CMT_SLASH}|{_CMT_BLOCK}|{_CMT_HASH}"),
-    "bt":   (f"{_STR_BT}|{_STR_DQ}|{_STR_SQ}", f"{_CMT_SLASH}|{_CMT_BLOCK}"),
-    "c":    (f"{_STR_DQ}|{_STR_SQ}", f"{_CMT_SLASH}|{_CMT_BLOCK}"),
-}
-_LANG_FAMILY = {"py": "py", "ruby": "ruby", "php": "php", "js": "bt", "go": "bt"}
-_TOKEN_RX = {
-    fam: re.compile(f"(?P<s>{strs})|(?P<c>{cmts})")
-    for fam, (strs, cmts) in _FAMILY_SYNTAX.items()
-}
-
-
-def _strip_comments(text: str, lang: str, string_repl: str | None) -> str:
-    """Drop comments for `lang`; keep strings verbatim (string_repl=None) or
-    mask each one with string_repl."""
-    rx = _TOKEN_RX[_LANG_FAMILY.get(lang, "c")]
-
-    def repl(m: re.Match[str]) -> str:
-        if m.lastgroup == "s":
-            return m.group(0) if string_repl is None else string_repl
-        return " "
-
-    return rx.sub(repl, text)
-
-
-def _mask_strings(text: str, lang: str) -> str:
-    """Mask string-literal contents but KEEP comments. For detectors whose
-    habitat is comments/code (residue phrases, boolean call args): a slop
-    phrase *quoted in a string* is a fixture or UI copy - the model pass
-    judges those in context, the scanner must not."""
-    rx = _TOKEN_RX[_LANG_FAMILY.get(lang, "c")]
-    return rx.sub(lambda m: "L" if m.lastgroup == "s" else m.group(0), text)
-
-
-def lang_of(rel: str) -> str:
-    ext = rel.rsplit(".", 1)[-1].lower() if "." in rel else ""
-    if ext == "py":
-        return "py"
-    if ext == "go":
-        return "go"
-    if ext == "rs":
-        return "rust"
-    if ext == "rb":
-        return "ruby"
-    if ext == "php":
-        return "php"
-    if ext in ("java", "kt", "kts", "cs", "scala"):
-        return "cstyle"
-    if ext in ("ts", "tsx", "js", "jsx", "mjs", "cjs", "vue", "svelte", "astro"):
-        return "js"
-    return "other"
+READ_CAP = 4000
+FILE_CAP = 6000
+SHOW_CAP = 10
 
 
 def git(root: str, *args: str) -> str | None:
-    # quotepath=false: git would otherwise octal-escape non-ASCII paths and the
-    # escaped name would never open. UTF-8 decode: text=True would use the
-    # locale codec (cp1252 on Windows) and crash on real UTF-8 diffs.
     try:
         p = subprocess.run(
             ["git", "-C", root, "-c", "core.quotepath=false", *args],
             capture_output=True, encoding="utf-8", errors="replace",
         )
     except OSError:
-        # FileNotFoundError (git binary not on PATH) or PermissionError. Both
-        # mean "git unavailable" — degrade to None so callers' is_git checks
-        # flip false and the scan reports "not a git repo" instead of crashing.
         return None
     return p.stdout if p.returncode == 0 else ""
 
@@ -389,8 +200,6 @@ def read_whole(root: str, rel: str) -> tuple[list[str] | None, bool]:
     None = unreadable (missing/permission); callers must surface it, because a
     silent skip turns a vanished file into a false 'no slop found'."""
     try:
-        # utf-8-sig: PowerShell writes BOMs by default; a surviving \ufeff on
-        # line 1 would defeat every ^-anchored detector.
         with open(os.path.join(root, rel), encoding="utf-8-sig", errors="ignore") as fh:
             lines = [ln.rstrip("\n") for ln in islice(fh, READ_CAP + 1)]
     except OSError:
@@ -427,16 +236,12 @@ def is_redundant_comment(line: str) -> bool:
 
 def _dep_line_hit(ln: str) -> bool:
     for m in DEP.finditer(ln):
-        # Line-start metadata ("version": "2.1.0") is a manifest field, not a dep.
         if m.start() == 0 and m.group("name").lower() in META_KEYS:
             continue
         return True
     return False
 
 
-# Every per-file slop signal scan_lines emits, with its report label (padded
-# to one column) and summary label. Gate, totals, and printing derive from
-# this one table.
 _SIGNALS = {
     "dependencies":       ("new dependency       ", "dep"),
     "abstractions":       ("premature abstraction", "abstraction"),
@@ -469,16 +274,9 @@ def scan_lines(rel: str, lines: list[str], audit: bool) -> Finding | None:
     found: dict[str, list[str]] = {k: [] for k in _SIGNAL_KEYS}
     check_deps = (not audit) and bool(MANIFEST.search(os.path.basename(rel)))
     for i, ln in enumerate(lines):
-        # Dep detection reads raw lines: in manifests the strings ARE the data.
         if check_deps and _dep_line_hit(ln):
             found["dependencies"].append(ln.strip()[:100])
-        # Comment-habitat detectors run on the string-masked line (comments
-        # kept): a slop pattern *quoted in a string* is a fixture, a log
-        # message, or UI copy - context for the model pass, not the scanner.
         masked = _mask_strings(ln, lang)
-        # Code signals only apply to source files: pattern vocabulary inside
-        # markdown prose is documentation, not an abstraction. (Deps stay
-        # separate - manifests are not SOURCE files.)
         if is_source:
             m = ABSTRACTION.search(masked)
             if m:
@@ -489,14 +287,10 @@ def scan_lines(rel: str, lines: list[str], audit: bool) -> Finding | None:
                     found["abstractions"].append(v.group(1))
             if is_redundant_comment(masked):
                 found["redundant_comments"].append(ln.strip()[:100])
-            # Banner/emoji stay on the raw line (a celebration emoji in
-            # user-facing copy IS the slop).
             if (RESIDUE_PHRASE.search(masked) or RESIDUE_BANNER.match(ln)
                     or RESIDUE_EMOJI.search(ln)):
                 found["ai_residue"].append(ln.strip()[:100])
         if lang in ("js", "cstyle", "php"):
-            # Mask strings + comments first: `as any` and `catch {}` are also
-            # English prose / string content.
             code = _strip_comments(ln, lang, "L")
             if lang == "js" and (
                 TS_SUPPRESS.search(masked)
@@ -505,8 +299,6 @@ def scan_lines(rel: str, lines: list[str], audit: bool) -> Finding | None:
                 found["type_escapes"].append(ln.strip()[:100])
             if JS_SWALLOW.search(code):
                 found["swallowed_errors"].append(ln.strip()[:100])
-            # Raw line: the string-literal tautology alternative needs the
-            # actual quotes, which masking would erase.
             if JS_TAUTOLOGY.search(ln):
                 found["tautological_tests"].append(ln.strip()[:100])
             if BOOL_PAIR_JS.search(code):
@@ -537,16 +329,8 @@ def scan_lines(rel: str, lines: list[str], audit: bool) -> Finding | None:
             TAILWIND_SOUP.search(ln) or TAILWIND_MAGIC_PX.search(ln)
         ):
             found["tailwind_slop"].append(ln.strip()[:100])
-        # Bare re-export indirection: JS-family only. A line that ships nothing
-        # of its own and just re-surfaces another module's exports. Barrel files
-        # that earn their place stay; the model judges, the scanner flags.
         if lang == "js" and BARE_REEXPORT.match(ln):
             found["reexport_slop"].append(ln.strip()[:100])
-    # Semantic opacity: low-density identifiers introduced in this file. Lazy
-    # import because low_density imports scan_slop at module load (sibling
-    # resolution) - a top-level import here would cycle. Only declarations
-    # count, not references, so a CALL to processData(x) does not trip unless
-    # the agent also declared function processData on an audited line.
     if is_source:
         try:
             import low_density
@@ -554,9 +338,6 @@ def scan_lines(rel: str, lines: list[str], audit: bool) -> Finding | None:
                     low_density.score_identifiers(lines, rel)):
                 found["semantic_density"].append(item[:140])
         except Exception:
-            # Never let the density layer break the rest of the scan. If
-            # low_density.py is absent (older install) or errors, the other
-            # twelve signals still run.
             pass
     found = {k: _uniq(v) for k, v in found.items()}
     added_count = sum(1 for ln in lines if ln.strip())
@@ -567,260 +348,6 @@ def scan_lines(rel: str, lines: list[str], audit: bool) -> Finding | None:
                     "substantial": substantial}
     out.update(found)
     return out
-
-
-# ---- body capture + hashing ---------------------------------------------
-def _indent(s: str) -> int:
-    return len(s) - len(s.lstrip())
-
-
-def capture_body(lines: list[str], start_idx: int, lang: str) -> tuple[str, bool]:
-    """Body text and whether capture hit the BODY_CAP window (truncated)."""
-    if lang in ("py", "ruby"):
-        base = _indent(lines[start_idx])
-        window = lines[start_idx + 1:start_idx + 1 + BODY_CAP]
-        out: list[str] = []
-        for ln in window:
-            if lang == "py" and ln.strip() and _indent(ln) <= base:
-                break
-            if lang == "ruby" and ln.strip() == "end" and _indent(ln) <= base:
-                break
-            out.append(ln)
-        else:
-            return "\n".join(out), len(lines) > start_idx + 1 + BODY_CAP
-        return "\n".join(out), False
-    # brace languages
-    sig = lines[start_idx]
-    arrow = sig.find("=>")
-    if arrow >= 0 and sig.find("{", arrow) < 0:
-        return sig[arrow + 2:].split(";")[0], False
-    brace_line = -1
-    for k in range(start_idx, min(start_idx + 6, len(lines))):
-        if "{" in lines[k]:
-            brace_line = k
-            break
-        if ";" in lines[k] and "=>" not in lines[k]:
-            return "", False
-    if brace_line < 0:
-        return "", False
-    depth, started = 0, False
-    out_chars: list[str] = []
-    for ln in lines[brace_line:brace_line + 1 + BODY_CAP]:
-        for ch in ln:
-            if ch == "{":
-                depth += 1
-                if depth == 1:
-                    started = True
-                    continue
-            elif ch == "}":
-                depth -= 1
-                if depth == 0 and started:
-                    return "".join(out_chars), False
-            if started:
-                out_chars.append(ch)
-        if started:
-            out_chars.append("\n")
-    # Never saw the closing brace inside the window: cap hit (or EOF mid-body).
-    return "".join(out_chars), True
-
-
-def normalize_body(text: str, lang: str) -> str:
-    """Whitespace/comment-insensitive but literal-sensitive text, for the
-    exact-duplicate hash. Strings survive verbatim (URLs differ => bodies differ)."""
-    text = _strip_comments(text, lang, string_repl=None)
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def structural_body(text: str, lang: str) -> str:
-    """Mask identifiers + literals; keep keywords/operators. Two bodies with the
-    same control-flow shape but drifted names/values hash equal => near-duplicate."""
-    text = _strip_comments(text, lang, string_repl="L")
-    text = re.sub(r"\b\d[\w.]*\b", "N", text)
-    text = ID.sub(lambda m: m.group(0) if m.group(0) in KEYWORDS else "I", text)
-    return re.sub(r"\s+", "", text)
-
-
-def _digest(s: str) -> str:
-    # blake2b, not md5: FIPS-enabled Pythons refuse md5 outright.
-    return hashlib.blake2b(s.encode("utf-8"), digest_size=16).hexdigest()
-
-
-def _is_exported(name: str, line: str, lang: str) -> bool:
-    if lang == "py":
-        return not name.startswith("_")     # public def: importable anywhere
-    if lang == "go":
-        return name[:1].isupper()           # Go exports by capitalization
-    return (bool(EXPORT_KEYWORD.search(line))
-            or "module.exports" in line or "exports." in line)
-
-
-def collect_defs(rel: str, lines: list[str]) -> list[Finding]:
-    lang = lang_of(rel)
-    decls = FUNC_PATTERNS.get(lang)
-    if not decls:
-        return []
-    defs: list[Finding] = []
-    for i, ln in enumerate(lines):
-        name = None
-        for rx in decls:
-            m = rx.search(ln)
-            if m:
-                cand = m.group(1)
-                if rx in (METHOD_JS, METHOD_CSTYLE) and cand in NOT_METHOD:
-                    continue
-                name = cand
-                break
-        if not name:
-            continue
-        raw, truncated = capture_body(lines, i, lang)
-        nb = normalize_body(raw, lang)
-        sb = structural_body(raw, lang)
-        # Non-blank lines only: the brace walk pads raw with edge newlines,
-        # and counting them would let `super(props);` pad its body_line count.
-        body_lines = sum(1 for s in raw.splitlines() if s.strip()) or 1
-        # Exact-dup hash needs substance (>=12 normalized chars). An earlier
-        # >=3-lines-or->=60-chars floor excluded the skill's own marquee case -
-        # tiny predicates like isRecord/isObject (1 line, ~40 chars) whose
-        # byte-identical bodies are exactly the duplication worth surfacing.
-        # Boilerplate like `return;`/`return x;` stays under the 12-char floor.
-        # A truncated body is a prefix, not the function - never call it exact.
-        hash_exact = (not truncated and len(nb) >= 12)
-        defs.append({
-            "name": name, "file": rel, "line": i + 1,
-            "exported": _is_exported(name, ln, lang),
-            "exact": _digest(nb) if hash_exact else None,
-            "struct": _digest(sb) if len(sb) >= 20 else None,  # skip trivial one-liners (return I;)
-            "body_lines": body_lines,
-            "truncated": truncated,
-        })
-    return defs
-
-
-def collect_types(rel: str, lines: list[str]) -> list[Finding]:
-    if lang_of(rel) != "js":
-        return []
-    out: list[Finding] = []
-    for ln in lines:
-        m = TYPE_DECL.search(ln)
-        if m:
-            out.append({"name": m.group(1), "file": rel})
-    return out
-
-
-def _index_only_dirs(files: list[str]) -> list[Finding]:
-    """Directories whose only scanned source file is an `index.*` module.
-
-    The barrel-indirection smell a per-file scan cannot see: a single-file dir
-    whose only occupant is `index.ts` (or .tsx/.js/...) is almost always re-
-    export scaffolding rather than a real module. Only meaningful in --all (the
-    full file list); a partial scan would flag dirs whose siblings simply were
-    not in the path list.
-    """
-    by_dir: dict[str, set[str]] = defaultdict(set)
-    for f in files:
-        parts = f.rsplit("/", 1)
-        if len(parts) != 2:           # root-level file: no enclosing dir
-            continue
-        d, name = parts
-        by_dir[d].add(name)
-    out: list[Finding] = []
-    for d, names in by_dir.items():
-        if len(names) != 1:
-            continue
-        only = next(iter(names))
-        if INDEX_FILE.match(only):
-            out.append({"dir": d, "file": only, "confidence": "structural"})
-    out.sort(key=lambda x: x["dir"])
-    return out
-
-
-def analyze_duplication(defs: list[Finding], types: list[Finding],
-                        idfreq: Counter[str], full_scope: bool,
-                        all_files: list[str] | None = None) -> Finding:
-    by_name: dict[str, list[Finding]] = defaultdict(list)
-    by_exact: dict[str, list[Finding]] = defaultdict(list)
-    by_struct: dict[str, list[Finding]] = defaultdict(list)
-    name_def_counts: Counter[str] = Counter()
-    for d in defs:
-        by_name[d["name"]].append(d)
-        name_def_counts[d["name"]] += 1
-        if d["exact"]:
-            by_exact[d["exact"]].append(d)
-        if d["struct"]:
-            by_struct[d["struct"]].append(d)
-
-    name_clones = []
-    for name, ds in by_name.items():
-        files = sorted({d["file"] for d in ds})
-        if len(files) >= 2 and name.lower() not in COMMON_NAMES:
-            name_clones.append({"name": name, "count": len(ds), "files": files,
-                                "confidence": "name-only"})
-    name_clones.sort(key=lambda x: -x["count"])
-
-    body_clones = []
-    for ds in by_exact.values():
-        names = sorted({d["name"] for d in ds})
-        files = sorted({d["file"] for d in ds})
-        if len(ds) >= 2 and (len(files) >= 2 or len(names) >= 2):
-            body_clones.append({"names": names, "files": files, "count": len(ds),
-                                "confidence": "exact"})
-    body_clones.sort(key=lambda x: -x["count"])
-
-    near_clones = []
-    for ds in by_struct.values():
-        exacts = {d["exact"] for d in ds if d["exact"]}
-        if len(ds) >= 2 and len(exacts) >= 2:  # same shape, genuinely different bodies
-            names = sorted({d["name"] for d in ds})
-            files = sorted({d["file"] for d in ds})
-            near_clones.append({"names": names, "files": files, "count": len(ds),
-                                "confidence": "structural"})
-    near_clones.sort(key=lambda x: -x["count"])
-
-    # Reference counts only mean something when every file was scanned; on a
-    # partial file list "0 references" is an artifact of the scope, and acting
-    # on it would delete live code.
-    single_use: list[Finding] = []
-    if full_scope:
-        seen_su: set[str] = set()
-        for d in defs:
-            name = d["name"]
-            if name in seen_su or name.lower() in COMMON_NAMES:
-                continue
-            small = d["body_lines"] <= 3
-            util_ish = bool(MICRO_PREFIX.search(name)) or name.lower() in FINGERPRINTS
-            if not (small or util_ish):
-                continue
-            # Export-aware: exported defs may be public API / framework entry
-            # points, so we can't call them dead. Only judge repo-internal defs.
-            if d.get("exported"):
-                continue
-            refs = idfreq.get(name, 0) - name_def_counts[name]
-            if refs == 0:
-                seen_su.add(name)
-                single_use.append({"name": name, "file": d["file"], "kind": "dead"})
-            elif refs == 1 and util_ish:
-                seen_su.add(name)
-                single_use.append({"name": name, "file": d["file"], "kind": "inline"})
-
-    fp: dict[str, int] = defaultdict(int)
-    for d in defs:
-        if d["name"].lower() in FINGERPRINTS:
-            fp[d["name"]] += 1
-    micro = sum(1 for d in defs if MICRO_PREFIX.search(d["name"]) and d["body_lines"] <= 3)
-
-    type_files: dict[str, set[str]] = defaultdict(set)
-    for t in types:
-        type_files[t["name"]].add(t["file"])
-    type_clones = [{"name": n, "files": sorted(fs), "confidence": "name-only"}
-                   for n, fs in type_files.items()
-                   if len(fs) >= 2 and n.lower() not in COMMON_TYPES]
-
-    return {"name_clones": name_clones, "body_clones": body_clones,
-            "near_clones": near_clones, "single_use": single_use,
-            "type_clones": type_clones, "fingerprints": dict(sorted(fp.items(), key=lambda x: -x[1])),
-            "micro_count": micro, "total_defs": len(defs),
-            "truncated_defs": sum(1 for d in defs if d["truncated"]),
-            "index_only_dirs": (_index_only_dirs(all_files) if full_scope and all_files else [])}
 
 
 def target_files(root: str, base: str, paths: list[str], is_git: bool,
@@ -848,14 +375,6 @@ def target_files(root: str, base: str, paths: list[str], is_git: bool,
     return out, untracked, False
 
 
-def _dup_has_findings(dup: Finding | None) -> bool:
-    if not dup:
-        return False
-    return bool(dup["name_clones"] or dup["body_clones"] or dup["near_clones"]
-                or dup["single_use"] or dup["type_clones"] or dup["fingerprints"]
-                or dup["micro_count"] or dup.get("index_only_dirs"))
-
-
 def _print_capped(label: str, items: list[str]) -> None:
     for it in items[:SHOW_CAP]:
         print(f"  {label}: {it}")
@@ -866,7 +385,7 @@ def _print_capped(label: str, items: list[str]) -> None:
 def _print_duplication(dup: Finding) -> bool:
     nc, bc, near, su = dup["name_clones"], dup["body_clones"], dup["near_clones"], dup["single_use"]
     tc, fp = dup["type_clones"], dup["fingerprints"]
-    if not _dup_has_findings(dup):
+    if not dup_has_findings(dup):
         return False
     print("DUPLICATION (whole-codebase - the isRecord-class slop):")
     if nc:
@@ -907,8 +426,6 @@ def _print_duplication(dup: Finding) -> bool:
 
 
 def main() -> int:
-    # A cp1252 pipe (Windows capture) must degrade, not crash, on the
-    # non-ASCII paths core.quotepath=false deliberately preserves.
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(errors="replace")
     ap = argparse.ArgumentParser(description="Static AI-slop signal scanner (reports only).")
@@ -945,8 +462,6 @@ def main() -> int:
             if truncated:
                 read_capped.append(f)
     else:
-        # User diff.noprefix / diff.mnemonicPrefix config would change the
-        # +++ headers and silently break the b/ stripping in the parser.
         diff_added = parse_added_by_file(
             git(root, "-c", "diff.noprefix=false", "-c", "diff.mnemonicprefix=false",
                 "diff", args.base) or "") if is_git else {}
@@ -992,9 +507,7 @@ def main() -> int:
                               for k in _SIGNAL_KEYS}
     totals["files"] = len(results)
 
-    # The gate trips on slop only. "Substantial" is a checklist nudge for big
-    # clean changes, not a defect - a clean 40-line diff must pass.
-    slop_found = any(_file_slop(r) for r in results) or _dup_has_findings(dup)
+    slop_found = any(_file_slop(r) for r in results) or dup_has_findings(dup)
     exit_code = 1 if args.gate and slop_found else 0
 
     if args.format == "json":

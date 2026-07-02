@@ -20,8 +20,9 @@ designed hook chain or fail-open safety model**.
    collapsing, reordering, or removing steps without proving Cursor supports it:
    - `beforeSubmitPrompt` → `intent-precompile` (writes `.scope.json`)
    - `sessionStart` → `inject-doctrine` (governing text)
+   - `preToolUse` → `step0-gate` (deny Write/StrReplace/ApplyPatch without a contract)
    - `afterFileEdit` → `scope-refresh` (record + stash; fires on ALL edits)
-   - `postToolUse` → `scope-drain` (deliver stash as `additional_context`)
+   - `postToolUse` → `scope-drain` + `scope-git-sweep` + `milestone-verify` + `intent-anchor` (deliver stash as `additional_context`)
    - `beforeShellExecution` → `permission-gate` (deny list)
    - `stop` → `final-review` (`followup_message` + one-shot brake)
 3. **Preserve fail-open semantics.** Script internal errors must exit `0` and
@@ -36,8 +37,11 @@ designed hook chain or fail-open safety model**.
 5. **hooks.json spec-clean.** Only documented keys per Cursor docs:
    `command`, `timeout`, `loop_limit`, `failClosed`, `matcher`, `type`.
    No invented fields.
-6. **Cross-platform parity.** `linux/` (bash) and `windows/` (pwsh 7) must mirror
-   behavior; platform differences are limited to shell/runtime mechanics.
+6. **Single Node engine.** One `hooks/` tree, one `.mjs` per hook, three shared
+   modules (`hook-common.mjs`, `contract-store.mjs`, `session-state.mjs`). There
+   is no platform split to keep in parity — Windows and Linux run the same
+   `node ~/.agents/hooks/<name>.mjs` command. Flag any re-introduction of
+   `.ps1`/`.sh` duplicates or parity checks as scope creep.
 7. **Verify after any fix:** `node bin/cli.mjs verify` (or `npx cursordoctrine verify`
    from an install). All checks must pass.
 
@@ -58,8 +62,8 @@ Source: https://cursor.com/docs/agent/hooks
 | **timeout** | Set and reasonable (this pack: 5s except `stop` 30s) |
 | **loop_limit** | Only on `stop` / `subagentStop`; this pack uses `3` on `stop` |
 | **failClosed** | Explicit where set; matches script fail-open/fail-closed intent |
-| **User hook paths** | Commands reference `~/.agents/hooks/*` and `~/.cursor/inject-doctrine.*`; Windows install must expand `~/` to real profile path |
-| **Executable** | Linux `.sh` files executable after install (`chmod +x`) |
+| **User hook paths** | Commands reference `node ~/.agents/hooks/<name>.mjs`; Cursor expands `~/` to the profile path at runtime |
+| **Runtime** | `node` 18+ on PATH; no `chmod` needed (`.mjs` is not an executable script type) |
 
 ### Event → allowed output (must match implementation)
 
@@ -67,8 +71,9 @@ Source: https://cursor.com/docs/agent/hooks
 |-------|--------|----------------------|-----------------|
 | `beforeSubmitPrompt` | intent-precompile | May block/rewrite prompt (spec); this pack **never blocks** | *(none — side-effect only)* |
 | `sessionStart` | inject-doctrine | `additional_context` | `additional_context` |
+| `preToolUse` | step0-gate | `permission`, `user_message`, `agent_message` | allow/deny JSON |
 | `afterFileEdit` | scope-refresh | *(spec: edit control; stdout not used for context here)* | *(none — stash file)* |
-| `postToolUse` | scope-drain | `additional_context` | `additional_context` |
+| `postToolUse` | scope-drain (+ sweep, milestone-verify, intent-anchor) | `additional_context` | `additional_context` |
 | `beforeShellExecution` | permission-gate | `permission`, `user_message`, `agent_message` | allow/deny JSON |
 | `stop` | final-review | `followup_message` (only when `status === "completed"`) | `{}` or `followup_message` |
 
@@ -77,71 +82,71 @@ Source: https://cursor.com/docs/agent/hooks
 ## File inventory — audit each path
 
 Read every file below. For each, produce: **Status** (PASS / WARN / FAIL),
-**Spec alignment**, **Parity** (linux vs windows if applicable), **Notes**.
+**Spec alignment**, **Notes**.
 
 ### A. Hook wiring
 
 | File | Audit focus |
 |------|-------------|
-| `linux/hooks.json` | All 6 events wired; timeouts; no matcher on afterFileEdit (fires on ALL edits); `failClosed: false` on beforeShellExecution; `loop_limit: 3` on stop; commands point to `~/.agents/hooks/` and `~/.cursor/inject-doctrine.sh` |
-| `windows/hooks.json` | Same events/options as linux; `pwsh.exe -NoProfile -File` prefix; paths use expanded `$HOME` after install (template uses `~/`) |
+| `hooks.json` | All 7 events wired; timeouts; matcher `Write\|StrReplace\|ApplyPatch\|Edit\|MultiEdit\|Replace` on `preToolUse`; no matcher on `afterFileEdit` (fires on ALL edits); `failClosed: false` on `beforeShellExecution`; `loop_limit: 3` on `stop`; every command is `node ~/.agents/hooks/<name>.mjs` |
 
-### B. Shared helpers
-
-| File | Audit focus |
-|------|-------------|
-| `linux/hooks/hook-common.sh` | `read_hook_stdin` BOM strip; jq/python3 fallback; `resolve_project_root` (cwd → workspace_roots → CURSOR_PROJECT_DIR → $PWD project-marker guard); `safe_conversation_id` transcript fallback; `extract_last_user_query` skips hook-generated turns + redacts secrets; `emit_json` ASCII-safe |
-| `windows/hooks/hook-common.ps1` | Parity with bash helpers: `Read-HookStdin`, `Write-HookJson` pure-ASCII stdout, `Resolve-ProjectRoot` (project-marker fallback for non-git repos), `Get-SafeConversationId`, `Get-LastUserQuery`, `Redact-SecretsFromIntent`, `Expand-AgentPaths` |
-
-### C. Hook scripts (pair audit linux + windows)
-
-| Hook | Files | Audit focus |
-|------|-------|-------------|
-| **intent-precompile** | `intent-precompile.sh`, `.ps1` | Kill switches `HOOKS_ENFORCE`, `INTENT_PRECOMPILE_ENFORCE`; reads `prompt` from stdin; skips hook-generated prefixes; no repo root → silent exit; writes `prompt` (hook-owned), seeds `intent = ""` on new/fresh; Jaccard topic change resets scope; stashes `STEP 0 CONTRACT` to `precompile-<cid>.txt` when contract incomplete; preserves agent fields on continuation; never blocks |
-| **inject-doctrine** | `../inject-doctrine.sh`, `../inject-doctrine.ps1` | Kill switch N/A; drains stdin; reads `doctrine.md` from install dir (`$HOME/.cursor/` when installed); emits `additional_context`; fail-open `{}`; ps1 ASCII-escapes non-ASCII; sh sources `$HOME/.agents/hooks/hook-common.sh` |
-| **scope-refresh** | `scope-refresh.sh`, `.ps1` | Kill switches `HOOKS_ENFORCE`, `SCOPE_REFRESH_ENFORCE`; requires `.scope.json`; records edited path into `files[]` (dedup, never `.scope.json`); stashes reminder to `~/.cursor/.hooks-pending/scope-<cid>.txt`; silent without contract |
-| **scope-drain** | `scope-drain.sh`, `.ps1` | One-shot: read `precompile-<cid>.txt` and/or `scope-<cid>.txt`, delete, emit combined `additional_context`; silent when no stash; shares kill switch with scope-refresh |
-| **milestone-verify** | `milestone-verify.sh`, `.ps1` | Kill switches `HOOKS_ENFORCE`, `MILESTONE_VERIFY_ENFORCE`; requires `.scope.json` with non-empty `decomposition[]`; emits `VERIFY MILESTONE step N` when step's `expected_files` all touched; scrapes `ACCEPT/REVISE step N` from assistant transcript turns into `verifications[]`; silent on empty decomposition (YAGNI rung 1); (Linux) requires python3 |
-| **intent-anchor** | `intent-anchor.sh`, `.ps1` | Kill switches `HOOKS_ENFORCE`, `INTENT_ANCHOR_ENFORCE`; re-fires when contract incomplete AND (never nudged OR new files edited); per-cid flag stores `filesCount:nudgeCount`; cap 99999; silent permanently once both fields filled |
-| **permission-gate** | `permission-gate.sh`, `.ps1` | Kill switch `PERM_GATE_ENFORCE`; deny list parity (rm -rf absolute, fork bomb, curl\|sh, wget\|sh, git push --force, reset --hard, clean -f, dd/mkfs to devices, chmod/chown -R on /, npm/pnpm/yarn publish); anchored patterns avoid false positives (`git rm`, echo); internal error → allow; exit 0 always |
-| **final-review** | `final-review.sh`, `.ps1` | Kill switches `HOOKS_ENFORCE`, `FINAL_REVIEW_ENFORCE`; only `status === completed`; `reviewed-<cid>.flag` verify-revise brake (stores content-hash signature of diff scoped to `files[]`; re-reviews if signature changed, ends if same); 7-day stale sweep; git diff HEAD + untracked (falls back to `.scope.json` `files[]` for non-git projects); `.scope.json` declared vs touched diff; intent from scope then transcript; arms flag with signature before emit; `loop_limit: 3`; `.md` REQUIRED (no stale fallback — emits install error if missing) |
-
-### D. Prompt bodies (must stay in sync: linux/hooks/ mirrors windows/hooks/)
+### B. Shared modules (one engine, three owners)
 
 | File | Audit focus |
 |------|-------------|
-| `hooks/final-review.md` | Eight axes (0-7); structured bullet report with ACCEPT/REVISE verdict; intent trace rules; [DRAFT] detection; prior-turn work guard; `.scope.json` declared scope; scanner scoped not `--all` |
-| `hooks/anti-slop.md` | 40-item checklist; pairs with `skills/anti-slop/scripts/scan_slop.py` |
-| `hooks/cleanup-doctrine.md` | Whole-repo sweep doctrine for `cursordoctrine sweep` only; distinct from session final-review |
+| `hooks/hook-common.mjs` | stdin/stdout (BOM strip, ASCII-safe JSON), `resolveProjectRoot` (cwd → workspace_roots → CURSOR_PROJECT_DIR → PWD project-marker guard, never bare `$HOME`), `conversationId` transcript fallback, `extractLastUserQuery` skips hook-generated turns + redacts secrets, `scopeRelativePath` (Windows drive case-insensitive, backslash normalize, parent-traversal guard), `getLastVerdict` transcript scrape, `runMinimality`, `runHookMain`/`isMainModule` via `import.meta.url` |
+| `hooks/contract-store.mjs` | Owns the `.scope.json` shape: `resetScope`/`continuationScope`/`readScope`/`writeScopeAtomic`/`updateScope`/`recordFiles`/`mergeFiles`/`setVerdict`/`intentNeedsStep0`/`acceptanceIsDefault`/`realFiles`/`contractSignature`; atomic write + lock; no shape re-declaration elsewhere |
+| `hooks/session-state.mjs` | Owns `~/.cursor/.hooks-pending/`: `stash`/`drain`/`readStash`/`clearStash`, `writeSessionStartStamp`/`ensureSessionStartStamp`/`getSessionStartUtc`/`pathModifiedSinceSession`, `readNudge`/`writeNudge`/`throttle`, `touchReviewedFlag`/`readReviewedFlag`/`clearReviewedFlag`/`handleReviewedFlag`, 7-day stale sweep |
 
-### E. Doctrine
+### C. Hook scripts (one `.mjs` per hook)
 
-| File | Audit focus |
-|------|-------------|
-| `linux/doctrine.md`, `windows/doctrine.md` | Identical content; ~80 lines; `.scope.json` contract matches intent-precompile + scope-refresh behavior; no contradiction with HOOKS.md |
+| Hook | File | Audit focus |
+|------|------|-------------|
+| **intent-precompile** | `intent-precompile.mjs` | Kill switches `HOOKS_ENFORCE`, `INTENT_PRECOMPILE_ENFORCE`; reads `prompt` from stdin; skips hook-generated prefixes; no repo root → silent exit; writes `prompt` (hook-owned), seeds `intent = ""` on new/fresh; Jaccard topic change resets scope; stashes `STEP 0 CONTRACT` to `precompile-<cid>.txt` when contract incomplete; preserves agent fields on continuation; never blocks |
+| **inject-doctrine** | `inject-doctrine.mjs` | No kill switch; drains stdin; prefers `~/.cursor/doctrine.md` override else `HOOKS_DIR/doctrine.md`; emits `additional_context`; stamps `sessionStart`; fail-open `{}` |
+| **step0-gate** | `step0-gate.mjs` | Kill switch `STEP0_GATE_ENFORCE`; always allows `.scope.json`; denies edits when `intent` empty/`[DRAFT]`; denies a second distinct file when `files[]` has >=1 real entry and `decomposition[]` empty; fail-open when no `.scope.json`/no root/unparseable target |
+| **scope-refresh** | `scope-refresh.mjs` | Kill switches `HOOKS_ENFORCE`, `SCOPE_REFRESH_ENFORCE`; requires `.scope.json`; records edited path into `files[]` (dedup, never `.scope.json`, prunes placeholders); early-returns for `.cursor/plans/**`; stashes reminder to `scope-<cid>.txt`; signature-gated (full text only when contract changed); silent without contract |
+| **scope-drain** | `scope-drain.mjs` | One-shot: drain `precompile-<cid>.txt` and/or `scope-<cid>.txt`, delete on read, emit combined `additional_context`; silent when no stash; shares kill switch with scope-refresh |
+| **scope-git-sweep** | `scope-git-sweep.mjs` | Kill switches `HOOKS_ENFORCE`, `SCOPE_REFRESH_ENFORCE`; only after Shell/Bash tools (not Edit tools); unions git-changed paths modified after `session-start-<cid>.txt` into `files[]`; ignores `.cursor/plans/**`; never emits context |
+| **milestone-verify** | `milestone-verify.mjs` | Kill switches `HOOKS_ENFORCE`, `MILESTONE_VERIFY_ENFORCE`; emits `VERIFY MILESTONE step N` when step's `expected_files` all touched and no verdict; scrapes `ACCEPT/REVISE step N` (incl. loosened phrasings) from transcript into `verifications[]`; auto-writes `PENDING`; `DECOMPOSE` nudge on >=2 files with empty decomposition (throttled, cap `DECOMPOSE_NUDGE_CAP`); silent on empty decomposition with <2 files |
+| **intent-anchor** | `intent-anchor.mjs` | Kill switches `HOOKS_ENFORCE`, `INTENT_ANCHOR_ENFORCE`; re-fires when contract incomplete AND (never nudged OR new files edited); per-cid flag stores `filesCount:nudgeCount`; cap `INTENT_ANCHOR_NUDGE_CAP` (default 99999); silent permanently once both fields filled |
+| **permission-gate** | `permission-gate.mjs` | Kill switch `PERM_GATE_ENFORCE`; deny list (rm -rf absolute, fork bomb, curl\|sh, wget\|sh, git push --force, reset --hard, clean -f, dd/mkfs to devices, chmod/chown -R on /, npm/pnpm/yarn publish, recursive forced delete of drive/Users/Windows root); anchored patterns avoid false positives (`git rm`, echo); reads raw stdin command; internal error → allow; exit 0 always |
+| **final-review** | `final-review.mjs` | Kill switches `HOOKS_ENFORCE`, `FINAL_REVIEW_ENFORCE`; only `status === completed`; `reviewed-<cid>.flag` verify-revise brake (SHA256 content-hash signature of diff scoped to `files[]`; re-reviews if changed, ends if same); 7-day stale sweep; git diff HEAD + untracked (falls back to `.scope.json` `files[]` for non-git projects); `.scope.json` declared vs touched diff; role-trace from `decomposition[]`; intent from scope then transcript; arms flag before emit; `loop_limit: 3`; `final-review.md` resolved next to the engine (REQUIRED); minimality metric via `minimality.py` (fail-open without Python) |
 
-### F. CLI installer
-
-| File | Audit focus |
-|------|-------------|
-| `bin/cli.mjs` | `install` copies correct platform payload; merges (not overwrites) `~/.cursor/hooks.json`; reaps `STALE_HOOK_FILES`; `isStaleOurs` does not drop `inject-doctrine`; `verify` covers: JSON parse, path resolution, permission gate, intent-precompile create/preserve/skip, scope refresh/drain one-shot, final-review once/quiet; `sweep`/`uninstall` intact; Node >= 18, zero deps |
-| `package.json` | `files` array ships all payloads; version matches changelog intent |
-
-### G. Documentation
-
-| File | Audit focus |
-|------|-------------|
-| `HOOKS.md` | Matches actual events (6 events, not "three hooks" if doc drift); kill switches complete (`INTENT_PRECOMPILE_ENFORCE`, `SCOPE_REFRESH_ENFORCE`); stash-drain explained; state paths under `~/.cursor/.hooks-pending/` |
-| `README.md` | Install path, prerequisites (pwsh 7, jq/python3), verify command, session vs sweep; **flag** if "fail closed" wording contradicts permission-gate fail-open |
-| `INSTALL.md` | Manual steps match cli.mjs behavior; merge instructions; verify payloads |
-
-### H. Anti-slop skill
+### D. Prompt bodies (payload files shipped in `hooks/`)
 
 | File | Audit focus |
 |------|-------------|
-| `skills/anti-slop/SKILL.md` | Describes on-demand sweep; does not claim to replace hooks |
-| `skills/anti-slop/scripts/scan_slop.py` | Runnable; used by `sweep`; no false coupling to session review `--all` |
-| `skills/anti-slop/scripts/low_density.py` | Shared scorer for `scan_slop.py` `semantic_density` bucket; no separate per-edit wrapper |
+| `hooks/final-review.md` | Eight axes (0-7); structured bullet report with ACCEPT/REVISE verdict; intent trace rules; `[DRAFT]` detection; prior-turn work guard; `.scope.json` declared scope; scanner scoped not `--all` |
+| `hooks/doctrine.md` | ~80 lines; `.scope.json` contract matches intent-precompile + scope-refresh behavior; no contradiction with HOOKS.md |
+| `hooks/minimality.py` | Stdlib-only; emits SUMMARY block with `worstRatio`/`worstFile`; consumed by `final-review.mjs` via `runMinimality`; fail-open when absent |
+
+### E. CLI installer
+
+| File | Audit focus |
+|------|-------------|
+| `bin/cli.mjs` | `install` copies `hooks/` (`.mjs` + `.md` + `.py`, excluding `__pycache__`) to `~/.agents/hooks/`; copies `skills/anti-slop/`; merges (not overwrites) `~/.cursor/hooks.json`; reaps legacy `windows/`/`linux/` (`.ps1`/`.sh`) packs + retired keys via `LEGACY_HOOK_FILES`/`LEGACY_CURSOR_FILES`; `isOurs`/`keyOf`/`isStaleOurs` keyed on `node ~/.agents/hooks/<name>.mjs`; `runHook` spawns `node`; prereq checks for node/python/git; `verify` runs the registry; `sweep`/`uninstall` intact; Node >= 18, zero deps |
+| `bin/verify.mjs` | Thin runner: loads `bin/checks/index.mjs`, applies `--only`/`--filter`, prints grouped report; must stay <700 lines |
+| `bin/fixture.mjs` | `withRepo`/`withScope`/`withGitRepo`/`runHook`/`writeTranscript`/`stampSession` helpers; isolated temp dirs; env-sandboxed |
+| `bin/checks/*.mjs` | One module per hook + `install`/`sweep`/`c6`; each exports `checks(ctx)`; registry aggregates via `allChecks` |
+| `package.json` | `files` ships `hooks/` + `hooks.json` + `bin/` + `skills/anti-slop/`; `scripts.test` = `install && verify`; `scripts.verify` = `verify`; version matches changelog intent |
+
+### F. Documentation
+
+| File | Audit focus |
+|------|-------------|
+| `HOOKS.md` | Matches actual events (7 events); kill switches complete; stash-drain explained; state paths under `~/.cursor/.hooks-pending/`; no `.ps1`/`.sh` references |
+| `README.md` | Install path, prerequisites (node 18+, git, optional python), verify command, session vs sweep; layout shows the unified `hooks/` tree; **flag** if "fail closed" wording contradicts permission-gate fail-open |
+| `INSTALL.md` | Manual steps match cli.mjs behavior (copy `hooks/`, merge `hooks.json`, `node ~/.agents/hooks/<name>.mjs` verify payloads); no windows/linux split |
+
+### G. Anti-slop skill
+
+| File | Audit focus |
+|------|-------------|
+| `skills/anti-slop/SKILL.md` | Describes on-demand sweep; does not claim to replace hooks; references `final-review.mjs` (not `.ps1`/`.sh`) |
+| `skills/anti-slop/scripts/scan_slop.py` | Runnable; used by `sweep`; no false coupling to session review `--all`; imports `low_density` at runtime to avoid a module-load cycle |
+| `skills/anti-slop/scripts/low_density.py` | Shared scorer for `scan_slop.py` `semantic_density` bucket; imports shared leaf from `_language.py` |
+| `skills/anti-slop/scripts/_language.py` | Shared leaf extracted to break the `scan_slop` ↔ `low_density` circular import; no scanner logic duplicated |
 
 ---
 
@@ -156,15 +161,17 @@ Answer each yes/no with evidence (file:line or verify output):
 5. **final-review** second consecutive `stop` returns `{}` (brake cleared).
 6. **final-review** on clean repo (no diff) returns `{}`.
 7. **permission-gate** allows `git status`, denies `git push --force`.
-8. **resolve_project_root** never falls back to bare `$HOME` (ghost `.scope.json` guard).
+8. **resolveProjectRoot** never falls back to bare `$HOME` (ghost `.scope.json` guard).
 9. **inject-doctrine** missing file → `{}`, session still starts.
-10. **Hook skip lists** (intent-precompile case prefixes vs `extract_last_user_query` HOOK_HDR regex) are in sync across sh/ps1/py.
+10. **Hook skip lists** (intent-precompile case prefixes vs `extractLastUserQuery` HOOK_HDR regex vs `scan_slop.py` patterns) are in sync.
+11. **`isMainModule`** receives the entry module's `import.meta.url` (not the shared module's) so `runHookMain` actually fires.
+12. **`matchAll`** regexes in `getLastVerdictFromText` carry the global `g` flag.
 
 Run: `node bin/cli.mjs verify` and attach pass/fail summary.
 
 ---
 
-## Best-practice rubric (Cursor hooks + production shell)
+## Best-practice rubric (Cursor hooks + production node)
 
 Score each category PASS/WARN/FAIL:
 
@@ -172,14 +179,14 @@ Score each category PASS/WARN/FAIL:
 |----------|----------|
 | **Determinism** | Permission decisions and scope recording do not depend on LLM; prompt hooks not used where command hooks suffice |
 | **Idempotency** | `install` re-runnable; merge preserves foreign hooks; stale hook reaper safe |
-| **Observability** | Failures fail silently to user session (by design) — document where to debug (Hooks output channel) |
+| **Observability** | Failures fail silently to user session (by design) — document where to debug (Hooks output channel, `FINAL_REVIEW_DEBUG=1`) |
 | **Security** | Deny list covers irreversible ops; secrets redacted in intent trace; no secrets in repo |
-| **Portability** | Windows requires pwsh 7; Linux works with jq OR python3; git required for final-review |
-| **Encoding** | JSON stdout safe under any console code page (ps1 ASCII escape, sh `ensure_ascii`) |
+| **Portability** | One Node engine on Windows + Linux; git required for final-review; python optional for sweep/minimality |
+| **Encoding** | JSON stdout ASCII-safe via `JSON.stringify(..., null)` + redaction; no console code-page dependence |
 | **State hygiene** | State only under `~/.cursor/.hooks-pending/`; 7-day reap; never commit pending files |
 | **Doc truth** | README/HOOKS/INSTALL agree on event count, kill switches, fail-open vs fail-closed |
-| **Parity** | Every behavioral branch in `.sh` has equivalent in `.ps1` |
-| **YAGNI** | No extra hooks, no prompt-hook overkill, no duplicate state machines |
+| **Modularity** | `.scope.json` shape owned by `contract-store.mjs`; pending files owned by `session-state.mjs`; no re-declaration across hooks |
+| **YAGNI** | No extra hooks, no prompt-hook overkill, no duplicate state machines, no `.ps1`/`.sh` parity to maintain |
 
 ---
 
@@ -196,33 +203,30 @@ Flag as **process violation** if your audit would suggest any of these:
 - Make hooks exit non-zero on parse errors (breaks fail-open guarantee)
 - Add `preToolUse`/`subagentStop` hooks without a concrete gap (scope creep)
 - Use POSIX regex in `hooks.json` matchers (`[[:space:]]`, etc.)
-- Collapse linux/windows into one script (platform split is intentional)
+- Re-introduce a `.ps1`/`.sh` platform split or parity checks (the single Node engine is intentional)
 
 ---
 
 ## Output format (your response)
 
 ### 1. Executive summary
-3–5 bullets: overall health, highest-risk finding, doc drift, parity gaps.
+3–5 bullets: overall health, highest-risk finding, doc drift, modularity gaps.
 
 ### 2. Spec compliance matrix
-Table: Event | hooks.json | sh | ps1 | Cursor spec | Status
+Table: Event | hooks.json | hook .mjs | Cursor spec | Status
 
 ### 3. Findings table
 | ID | Severity | File | Finding | Recommendation | Breaks chain? |
 |----|----------|------|---------|----------------|---------------|
-Use severity: **critical** (wrong spec / data loss / session break), **high** (parity / wrong deny), **medium** (doc drift), **low** (style).
+Use severity: **critical** (wrong spec / data loss / session break), **high** (wrong deny / brake logic), **medium** (doc drift), **low** (style).
 
-### 4. Parity diff
-List any behavioral difference between `linux/hooks/*.sh` and `windows/hooks/*.ps1`.
-
-### 5. Documentation drift
+### 4. Documentation drift
 List contradictions between README, HOOKS.md, INSTALL.md, and code.
 
-### 6. verify output
+### 5. verify output
 Paste `node bin/cli.mjs verify` results (run it).
 
-### 7. Fix plan (optional)
+### 6. Fix plan (optional)
 Only if user asked to fix: minimal diffs, one commit per logical change, re-run verify.
 
 ---
@@ -230,14 +234,13 @@ Only if user asked to fix: minimal diffs, one commit per logical change, re-run 
 ## Quick reference — installed layout after `npx cursordoctrine install`
 
 ```
-~/.cursor/hooks.json          merged wiring
-~/.cursor/doctrine.md         sessionStart payload source
-~/.cursor/inject-doctrine.*   sessionStart command
-~/.cursor/skills/anti-slop/   sweep skill
-~/.agents/hooks/*.sh|ps1      hook scripts + *.md prompts
-~/.cursor/.hooks-pending/     scope-*.txt, reviewed-*.flag (runtime, not in repo)
+~/.cursor/hooks.json          merged wiring (node ~/.agents/hooks/<name>.mjs)
+~/.agents/hooks/*.mjs         the single Node engine + shared modules
+~/.agents/hooks/*.md, *.py    payload files (doctrine.md, final-review.md, minimality.py)
+~/.cursor/skills/anti-slop/   sweep skill (SKILL.md + scripts/)
+~/.cursor/.hooks-pending/     scope-*.txt, reviewed-*.flag, *.flag (runtime, not in repo)
 ```
 
-Repo source of truth: `linux/` or `windows/` + `bin/cli.mjs` + `skills/`.
+Repo source of truth: `hooks/` + `hooks.json` + `bin/` + `skills/`.
 
 Begin the audit now. Read all files in the inventory before writing findings.

@@ -14,85 +14,54 @@ Install the cursordoctrine hook package for Cursor on this machine, then verify 
 
 If `node --version` shows Node 18 or newer, prefer the npm installer: run `npx cursordoctrine@latest install`, then `npx cursordoctrine verify`, then skip to step 4. Otherwise continue with the manual steps.
 
-## 1. Ask the user which system they are on
+## 1. Confirm prerequisites
 
-Before touching anything, ask the user one question and wait for the answer:
+The hooks run on Node — one engine, every platform. Before touching anything, confirm:
 
-> "Are you installing on **Windows** or **Linux** (including SSH remotes)?"
-
-Do not guess from the shell you happen to be running in — a Windows machine driving an SSH remote needs the Linux package on the remote. Use the answer to pick the folder:
-
-- **Windows** → use the `windows/` folder of this repo (PowerShell hooks, run with `pwsh.exe`).
-- **Linux** → use the `linux/` folder (bash hooks).
-
-Check the prerequisites first:
-
-- Windows: **PowerShell 7 (`pwsh`) on PATH**, plus `git`. Python 3.9+ if you want the anti-slop scanner (`cursordoctrine sweep` uses it). Confirm with `pwsh -Version` — Windows PowerShell 5.1 (`powershell.exe`) is NOT supported; install PowerShell 7 via `winget install --id Microsoft.PowerShell --source winget` if missing.
-- Linux: `bash`, `git`, and either `jq` or `python3` (the hooks prefer `jq` and fall back to `python3`; install `jq` if neither is present). Python 3.9+ for the sweep scanner.
+- `node --version` shows Node 18 or newer. If not, install it (https://nodejs.org/ or `winget install OpenJS.NodeJS` / your distro's `nodejs` package). The unified engine will not run without it.
+- `git` on PATH (used by `scope-git-sweep` and `final-review` change detection).
+- Python 3.9+ (optional) — only for the anti-slop scanner (`cursordoctrine sweep`) and the minimality metric in `final-review`. Both fail open when Python is absent.
 
 ## 2. Copy the files
 
-Windows (from the repo root, in pwsh):
+From the repo root — same commands on Windows and Linux (PowerShell or bash):
 
 ```powershell
-New-Item -ItemType Directory -Force "$HOME\.agents\hooks", "$HOME\.cursor" | Out-Null
-Copy-Item windows\hooks\* "$HOME\.agents\hooks\" -Force
-Copy-Item windows\inject-doctrine.ps1, windows\doctrine.md "$HOME\.cursor\" -Force
-# hooks.json ships with ~/ placeholders; pwsh -File does NOT expand ~, so
-# substitute the real profile path (forward slashes) at install time:
-$h = $HOME -replace '\\', '/'
-(Get-Content windows\hooks.json -Raw).Replace('~/', "$h/") | Set-Content "$HOME\.cursor\hooks.json" -NoNewline
-# anti-slop skill (SKILL.md + the scanner the sweep command runs):
-New-Item -ItemType Directory -Force "$HOME\.cursor\skills" | Out-Null
+New-Item -ItemType Directory -Force "$HOME\.agents\hooks", "$HOME\.cursor", "$HOME\.cursor\skills" | Out-Null
+Copy-Item hooks\* "$HOME\.agents\hooks\" -Recurse -Force
+# hooks.json ships with ~/ placeholders that Cursor expands; copy as-is:
+Copy-Item hooks.json "$HOME\.cursor\hooks.json" -Force
 Copy-Item skills\anti-slop "$HOME\.cursor\skills\" -Recurse -Force
 ```
 
-Linux (from the repo root, in bash):
-
 ```bash
-mkdir -p ~/.agents/hooks ~/.cursor
-cp linux/hooks/* ~/.agents/hooks/
-cp linux/inject-doctrine.sh linux/doctrine.md ~/.cursor/
-cp linux/hooks.json ~/.cursor/hooks.json
-chmod +x ~/.agents/hooks/*.sh ~/.cursor/inject-doctrine.sh
-# anti-slop skill (SKILL.md + the scanner the sweep command runs):
-mkdir -p ~/.cursor/skills
+mkdir -p ~/.agents/hooks ~/.cursor/skills
+cp -r hooks/* ~/.agents/hooks/
+cp hooks.json ~/.cursor/hooks.json
 cp -r skills/anti-slop ~/.cursor/skills/
 ```
 
-If `~/.cursor/hooks.json` already exists, merge the hook entries instead of overwriting — preserve anything the user already has.
+If `~/.cursor/hooks.json` already exists, merge the hook entries instead of overwriting — preserve anything the user already has. (The npm installer does this merge for you; by hand, paste the seven event blocks from the shipped `hooks.json` into the existing file, keeping foreign entries.)
 
 ## 3. Verify before restarting Cursor
 
 Run each hook by hand with a fake payload and confirm the output. Every hook must exit 0; none of them may hang.
 
-Linux:
-
 ```bash
-echo '{"command":"git push --force"}' | bash ~/.agents/hooks/permission-gate.sh   # expect "permission":"deny"
-echo '{"command":"git status"}'       | bash ~/.agents/hooks/permission-gate.sh   # expect {"permission":"allow"}
+echo '{"command":"git push --force"}' | node ~/.agents/hooks/permission-gate.mjs   # expect "permission":"deny"
+echo '{"command":"git status"}'       | node ~/.agents/hooks/permission-gate.mjs   # expect {"permission":"allow"}
 # final-review needs a git repo to find changes. Seed a tiny one and modify a file:
 mkdir -p /tmp/cd-verify && cd /tmp/cd-verify && git init -q && echo a > f.txt && git add . && git commit -q -m init && echo b > f.txt
-echo '{"conversation_id":"t1","status":"completed","cwd":"/tmp/cd-verify"}' | bash ~/.agents/hooks/final-review.sh   # expect {"followup_message": ...}
-echo '{"conversation_id":"t1","status":"completed","cwd":"/tmp/cd-verify"}' | bash ~/.agents/hooks/final-review.sh   # expect {} (brake armed)
-echo '{}' | bash ~/.cursor/inject-doctrine.sh                                # expect {"additional_context": ...}
-python3 ~/.cursor/skills/anti-slop/scripts/scan_slop.py --help               # expect usage text
+echo '{"conversation_id":"t1","status":"completed","cwd":"/tmp/cd-verify"}' | node ~/.agents/hooks/final-review.mjs   # expect {"followup_message": ...}
+echo '{"conversation_id":"t1","status":"completed","cwd":"/tmp/cd-verify"}' | node ~/.agents/hooks/final-review.mjs   # expect {} (brake armed)
+echo '{}' | node ~/.agents/hooks/inject-doctrine.mjs                                # expect {"additional_context": ...}
+python ~/.cursor/skills/anti-slop/scripts/scan_slop.py --help                       # expect usage text (optional)
 rm -rf /tmp/cd-verify
 ```
 
-Windows (same payloads, swap `bash ~/...sh` for `pwsh.exe -NoProfile -File $HOME\.agents\hooks\<name>.ps1`, `inject-doctrine.ps1` lives in `$HOME\.cursor`, and use `python` instead of `python3`):
+On Windows use `python` instead of `python3` and adjust the temp path (`C:\tmp\cd-verify`). The hook commands are identical — `node ~/.agents/hooks/<name>.mjs` works on both platforms.
 
-```powershell
-echo '{"command":"git push --force"}' | pwsh.exe -NoProfile -File $HOME\.agents\hooks\permission-gate.ps1
-mkdir C:\tmp\cd-verify -Force; Set-Location C:\tmp\cd-verify; git init -q; 'a' | Out-File f.txt; git add .; git commit -q -m init; 'b' | Out-File f.txt
-echo '{"conversation_id":"t1","status":"completed","cwd":"C:/tmp/cd-verify"}' | pwsh.exe -NoProfile -File $HOME\.agents\hooks\final-review.ps1
-echo '{"conversation_id":"t1","status":"completed","cwd":"C:/tmp/cd-verify"}' | pwsh.exe -NoProfile -File $HOME\.agents\hooks\final-review.ps1
-echo '{}' | pwsh.exe -NoProfile -File $HOME\.cursor\inject-doctrine.ps1
-python $HOME\.cursor\skills\anti-slop\scripts\scan_slop.py --help
-Remove-Item C:\tmp\cd-verify -Recurse -Force
-```
-
-Also validate the config: `~/.cursor/hooks.json` must parse as JSON.
+Also validate the config: `~/.cursor/hooks.json` must parse as JSON, and every `command` must start with `node ~/.agents/hooks/`.
 
 ## 4. Verify inside Cursor
 

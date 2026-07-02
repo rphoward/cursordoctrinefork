@@ -33,100 +33,61 @@ import re
 import sys
 from typing import Any
 
-# Resolve sibling scan_slop.py at runtime. scan_slop imports this module via
-# `from low_density import ...` and this module imports scan_slop back; that
-# cycle resolves only when scripts/ is on sys.path. The insert makes the import
-# work regardless of the cwd Python was launched from.
 _SCRIPT_DIR = re.sub(r"[\\/][^\\/]+$", "", __file__) or "."
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
-# Reuse scan_slop's language detection + comment/string stripping rather than
-# duplicating the per-language tokenization that already lives there.
-import scan_slop  # noqa: E402  (path set up above)
+from _language import (
+    ID, TYPE_DECL, FUNC_PATTERNS, METHOD_JS, METHOD_CSTYLE, NOT_METHOD,
+    lang_of, _strip_comments,
+)
 
-ID = scan_slop.ID
-TYPE_DECL = scan_slop.TYPE_DECL
-FUNC_PATTERNS = scan_slop.FUNC_PATTERNS
-METHOD_JS = scan_slop.METHOD_JS
-METHOD_CSTYLE = scan_slop.METHOD_CSTYLE
-NOT_METHOD = scan_slop.NOT_METHOD
-lang_of = scan_slop.lang_of
-_strip_comments = scan_slop._strip_comments
-
-# ---- the denylist (single source of truth) --------------------------------
-# Token stems, lowercased. Matched case-insensitively against identifier
-# tokens. Kept short and high-signal: every entry here is one a senior would
-# flag on sight, and every false positive costs trust in the whole layer.
 LOW_DENSITY_TOKENS = frozenset({
-    # generic role nouns - describe a category, not a thing
     "manager", "mgr", "handler", "processor", "controller", "provider",
     "service", "svc", "engine", "framework", "system", "base", "core",
     "common", "shared", "generic", "universal", "global",
-    # filler nouns - mean nothing on their own
     "data", "info", "thing", "things", "stuff", "object", "item", "entity",
     "business", "misc", "util", "utils", "utility", "helper", "helpers",
     "tool", "tools",
-    # placeholder / temporaries that leaked to prod
     "temp", "tmp", "new", "old", "current", "local", "main", "simple",
 })
 
-# Filenames whose bare basename IS the low-density signal. A file named
-# utils.ts, helpers.py, manager.go communicates nothing. The fix is a
-# domain name: invoice_totals.ts, smtp_retry.py.
 LOW_DENSITY_FILENAMES = frozenset({
     "utils", "helpers", "helper", "common", "shared", "manager", "service",
     "provider", "handler", "processor", "engine", "base", "core", "misc",
     "stuff", "things", "temp", "tmp", "generic", "util", "utility",
     "controller", "framework", "system", "business", "global",
-    # NOTE: 'main' and 'app' are intentionally EXCLUDED - they are conventional
-    # entry-point names (next.js app/, rails application.py, fastapi main.py).
-    # Flagging them would make the hook fire on every new project scaffold.
 })
 
-# Verbs that name an action without naming the object of the action. Fine as
-# part of a longer name (GenerateMonthlyReport), suspect alone (process()).
-# Deliberately EXCLUDES concrete action verbs (get/set/send/load/save/fetch/
-# render/format/parse/validate/check/verify) - those name a specific operation
-# and are legitimate as methods on a domain-noun class (InvoiceEmailSender.send).
-# Only the truly content-free verbs (do/run/execute/process/handle/...) stay.
 ANEMIC_VERBS = frozenset({
     "do", "run", "execute", "process", "handle", "manage", "perform",
     "apply", "compute", "calculate", "make", "build", "update",
     "delete", "remove", "add",
 })
 
-# Suffixes that, on a class with no domain noun before them, are textbook
-# Meaningless Abstraction: DataProvider, CoreEngine, SystemManager. When a
-# domain noun precedes (PostgresUserRepository) the score stays WARN not FAIL.
 GENERIC_SUFFIXES = re.compile(
     r"(Manager|Handler|Processor|Controller|Provider|Service|Engine"
     r"|Framework|System|Factory|Builder|Wrapper|Adapter|Resolver"
     r"|Strategy|Mediator|Orchestrator|Registry|Repository)$"
 )
 
-# Placeholder fingerprints: tempFix, newThing, finalFinal, test2, abc, x1, fn.
 PLACEHOLDER = re.compile(
     r"^(temp|tmp|new|old|final|test|fix|copy|backup|draft|wip)"
     r"[A-Z0-9_]"
     r"|^(final){2,}"
-    r"|^[a-z]{0,2}\d+$"      # x1, fn2, abc123 (kept narrow: a-c only)
-    r"|^[a-z]{1,2}$"         # bare 1-2 char alpha: fn, cb, x, aq - predict nothing
+    r"|^[a-z]{0,2}\d+$"
+    r"|^[a-z]{1,2}$"
     r"|^(foo|bar|baz|qux|tmp|asdf|qwerty)$",
     re.I,
 )
 
-# A "domain noun" is an identifier token that is NOT in LOW_DENSITY_TOKENS and
-# NOT an anemic verb. Used to decide whether a generic-suffix class has real
-# subject matter or is pure filler (DataManager vs InvoiceEmailSender).
 def _tokens_of(name: str) -> list[str]:
     """Split a PascalCase / camelCase / snake_case name into lowercased word
     stems. UserEmailSender -> [user, email, sender]. process_data ->
     [process, data]. Single-word names return [self.lower()]."""
-    # split on non-alnum, then on case boundaries (aB -> a|B), then trailing digits
     s = re.sub(r"[^A-Za-z0-9]+", " ", name)
     s = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", s)
-    s = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", s)  # HTTPSConnection -> HTTPS Connection
+    s = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", s)
     s = re.sub(r"(\d+)$", r" \1", s)
     return [w.lower() for w in s.split() if w]
 
@@ -145,11 +106,6 @@ def _has_domain_noun(tokens: list[str]) -> bool:
     return False
 
 
-# Conventional CLI/runtime entrypoint names that are exempt from the
-# low-density signal even when they appear as a bare single token. `main` is
-# THE Python/C convention (`if __name__ == "__main__": main()`); `run` is the
-# common CLI entrypoint in Go binaries and many scripts. These get a pass only
-# as exact single-token function names, never inside larger names.
 ENTRYPOINT_NAMES = frozenset({"main", "run", "cli", "app"})
 
 
@@ -170,12 +126,9 @@ def score_density(name: str) -> tuple[str, list[str]]:
     lower = name.lower()
     tokens = _tokens_of(name)
 
-    # 0. Conventional CLI/runtime entrypoints get a free pass as bare names:
-    #    `main` (Python/C), `run`/`cli` (CLIs). These are idioms, not slop.
     if lower in ENTRYPOINT_NAMES:
         return "ok", []
 
-    # 1. Placeholder / temp-leaked-to-prod. Always FAIL - these never belong.
     if PLACEHOLDER.search(name):
         if re.match(r"^(final){2,}", name, re.I):
             return "fail", ["placeholder name (finalFinal / repeated 'final')"]
@@ -185,13 +138,9 @@ def score_density(name: str) -> tuple[str, list[str]]:
             return "fail", [f"cryptic 1-2 char id '{name}' - predict nothing"]
         return "fail", [f"placeholder name '{name}' - temp/test marker leaked to prod"]
 
-    # 2. Bare low-density single token: the name IS the filler word.
-    #    "Helper", "Utils", "Manager", "process", "Data" on their own.
     if len(tokens) == 1 and lower in LOW_DENSITY_TOKENS:
         return "fail", [f"bare low-density token '{name}' - names a category, not a thing"]
 
-    # 3. Generic-suffix class with no domain noun: DataManager, CoreEngine,
-    #    SystemProvider. The whole point of the abstraction is hidden.
     if GENERIC_SUFFIXES.search(name) and not _has_domain_noun(tokens):
         suffix = GENERIC_SUFFIXES.search(name).group(1)
         return "fail", [
@@ -200,18 +149,13 @@ def score_density(name: str) -> tuple[str, list[str]]:
             "     (e.g. DataManager -> InvoiceRepository or PersistUserSessions)",
         ]
 
-    # 4. Generic-suffix class WITH a domain noun: UserRepository,
-    #    StripePaymentProvider. WARN - defensible DDD, still worth a glance.
     if GENERIC_SUFFIXES.search(name) and _has_domain_noun(tokens):
         suffix = GENERIC_SUFFIXES.search(name).group(1)
         return "warn", [f"{suffix} suffix (has domain noun -> defensible, still generic)"]
 
-    # 5. Anemic verb alone (process, handle, run, do). Function-shaped, empty.
     if len(tokens) == 1 and lower in ANEMIC_VERBS:
         return "warn", [f"anemic verb '{name}()' - names an action without its object"]
 
-    # 6. Any remaining low-density token present (multiword): UserManager,
-    #    processStuff, DataThing. WARN if there's any domain noun, FAIL if not.
     low_hits = [t for t in tokens if t in LOW_DENSITY_TOKENS]
     if low_hits:
         joined = ", ".join(sorted(set(low_hits)))
@@ -219,9 +163,6 @@ def score_density(name: str) -> tuple[str, list[str]]:
             return "warn", [f"low-density token(s) [{joined}] but has domain noun -> defensible"]
         return "fail", [f"low-density token(s) [{joined}] and no domain noun -> opaque"]
 
-    # 7. Two-or-more word name where the leading token is an anemic verb and
-    #    the rest is filler: handleStuff, processData, doThing. FAIL - the
-    #    classic AI-slop function shape.
     if len(tokens) >= 2 and tokens[0] in ANEMIC_VERBS:
         rest_low = all(t in LOW_DENSITY_TOKENS for t in tokens[1:])
         if rest_low:
@@ -238,17 +179,13 @@ def score_filename(base: str) -> tuple[str, list[str]]:
     stem = re.sub(r"\.[A-Za-z0-9]+$", "", base).lower()
     if stem in LOW_DENSITY_FILENAMES:
         return "fail", [f"file named '{base}' - basename is a generic category, not a module"]
-    # conventional entry-point / layout names get a pass
     if stem in {"index", "mod", "main", "app", "server", "test", "tests",
                 "conftest", "__init__", "setup"}:
         return "ok", []
-    # multi-word file names (invoice_totals, user_repository) are fine even
-    # if they contain a low-density word, because the other word carries meaning
     parts = re.split(r"[^a-z0-9]+", stem)
     parts = [p for p in parts if p]
     low_hits = [p for p in parts if p in LOW_DENSITY_FILENAMES]
     if low_hits and not any(p not in LOW_DENSITY_FILENAMES for p in parts):
-        # all parts are low-density: e.g. utils_helpers.py
         return "fail", [f"file '{base}' - all name parts are generic ({', '.join(low_hits)})"]
     if low_hits:
         return "warn", [f"file '{base}' contains generic part(s) ({', '.join(low_hits)}) but has a specific part"]
@@ -260,18 +197,15 @@ def _def_names_from_patterns(line: str, lang: str) -> list[tuple[str, str]]:
     the line declares nothing. kind in {func, class, type, method}. Uses the
     same FUNC_PATTERNS as scan_slop so definitions parse identically."""
     out: list[tuple[str, str]] = []
-    # type/interface declarations (TS)
     m = TYPE_DECL.search(line)
     if m:
         out.append(("type", m.group(1)))
-    # class/struct/trait/protocol/interface (cstyle/rust/swift/etc.)
     cm = re.search(
         r"\b(?:class|struct|trait|protocol|interface|enum)\s+([A-Z][A-Za-z0-9_]*)\b",
         line,
     )
     if cm:
         out.append(("class", cm.group(1)))
-    # function-shaped declarations, per language
     patterns = FUNC_PATTERNS.get(lang, [])
     seen: set[str] = set()
     for rx in patterns:
@@ -301,7 +235,6 @@ def extract_identifiers(added_lines: list[str], rel: str) -> list[Finding]:
     """
     lang = lang_of(rel)
     if lang == "other":
-        # Still score the filename even for unknown languages.
         base = rel.rsplit("/", 1)[-1]
         sevs, reasons = score_filename(base)
         if sevs != "ok":
@@ -315,9 +248,6 @@ def extract_identifiers(added_lines: list[str], rel: str) -> list[Finding]:
     for i, raw in enumerate(added_lines, start=1):
         if not raw.strip():
             continue
-        # Skip pure-comment lines so a docstring mentioning "Manager" cannot
-        # trip the scorer. _strip_comments with string_repl="L" keeps strings
-        # masked so a string literal cannot trip it either.
         stripped = _strip_comments(raw, lang, "L").strip()
         if not stripped:
             continue
@@ -330,10 +260,6 @@ def extract_identifiers(added_lines: list[str], rel: str) -> list[Finding]:
                 findings.append({"name": name, "line": i, "kind": kind,
                                  "severity": sevs, "reasons": reasons})
 
-    # The file's own name is a naming decision too. Only flag if it's the
-    # file being created/renamed (the basename is always available; we score
-    # it always but it's cheap and a renamed utils.ts -> foo.ts deserves
-    # flagging the new name).
     base = rel.rsplit("/", 1)[-1]
     if base and base not in seen_names:
         sevs, reasons = score_filename(base)
@@ -364,8 +290,6 @@ def format_for_report(findings: list[Finding]) -> list[str]:
 
 
 if __name__ == "__main__":
-    # Smoke entrypoint: score names passed as argv so a human can sanity-check
-    # the scorer without writing a test harness.
     if len(sys.argv) > 1 and sys.argv[1] == "--self-test":
         cases = [
             ("DataManager", "fail"), ("CoreEngine", "fail"), ("process", "warn"),
@@ -388,7 +312,6 @@ if __name__ == "__main__":
             print(f"  {mark} {name:<32} got={sevs:<5} want={want}")
         print(f"\n{'PASS' if not fails else f'{fails} FAILURES'}")
         sys.exit(1 if fails else 0)
-    # default: score argv names as identifiers
     for n in sys.argv[1:]:
         sevs, reasons = score_density(n)
         print(f"{n}: {sevs} ({'; '.join(reasons)})")

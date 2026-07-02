@@ -1,23 +1,12 @@
 #!/usr/bin/env node
-// cursordoctrine — one-command installer for the cursordoctrine hook pack.
-//
-// The payload ships inside this npm package (windows/, linux/, skills/).
-// `install` removes any prior cursordoctrine pack from $HOME, then copies the
-// new payload (windows/, linux/, skills/), merging ~/.cursor/hooks.json instead of overwriting it. `verify` smoke-tests
-// every hook with fake payloads (INSTALL.md step 3). `uninstall` removes our
-// files and strips our hooks.json entries while preserving foreign ones.
-//
-// Zero runtime dependencies. Node >= 18.
 
 import {
-  chmodSync,
   cpSync,
   existsSync,
   mkdirSync,
   readFileSync,
   readdirSync,
   rmSync,
-  statSync,
   writeFileSync,
 } from 'node:fs';
 import { join, resolve, dirname } from 'node:path';
@@ -29,11 +18,10 @@ import { verify as runVerify } from './verify.mjs';
 const pkgRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const pkg = JSON.parse(readFileSync(join(pkgRoot, 'package.json'), 'utf8'));
 
-// CURSORDOCTRINE_HOME lets tests install into a sandbox home.
 const HOME = process.env.CURSORDOCTRINE_HOME || homedir();
-const platform = process.platform === 'win32' ? 'windows' : 'linux';
-const payload = join(pkgRoot, platform);
 
+const hooksSrc = join(pkgRoot, 'hooks');
+const hooksJsonSrc = join(pkgRoot, 'hooks.json');
 const hooksDst = join(HOME, '.agents', 'hooks');
 const cursorDst = join(HOME, '.cursor');
 const skillSrc = join(pkgRoot, 'skills', 'anti-slop');
@@ -41,46 +29,44 @@ const skillDst = join(cursorDst, 'skills', 'anti-slop');
 const pendingDir = join(cursorDst, '.hooks-pending');
 const hooksJsonDst = join(cursorDst, 'hooks.json');
 
-const injectName = platform === 'windows' ? 'inject-doctrine.ps1' : 'inject-doctrine.sh';
-const doctrineFiles = [injectName, 'doctrine.md'];
-
-// Hook scripts this pack used to ship but no longer does. install() deletes
-// these from ~/.agents/hooks so a version bump cannot leave orphans that call
-// functions removed from hook-common. Only explicit basenames — never wildcards.
-const STALE_HOOK_FILES = [
+const LEGACY_HOOK_FILES = [
+  'intent-precompile.ps1', 'intent-precompile.sh',
+  'step0-gate.ps1', 'step0-gate.sh',
+  'scope-refresh.ps1', 'scope-refresh.sh',
+  'scope-drain.ps1', 'scope-drain.sh',
+  'scope-git-sweep.ps1', 'scope-git-sweep.sh',
+  'milestone-verify.ps1', 'milestone-verify.sh',
+  'intent-anchor.ps1', 'intent-anchor.sh',
+  'permission-gate.ps1', 'permission-gate.sh',
+  'final-review.ps1', 'final-review.sh',
+  'inject-doctrine.ps1', 'inject-doctrine.sh',
+  'hook-common.ps1', 'hook-common.sh',
   'anti-slop-audit.ps1', 'anti-slop-audit.sh',
   'post-tool-use.ps1', 'post-tool-use.sh',
   'scope-gate-audit.ps1', 'scope-gate-audit.sh',
   'self-review-trigger.ps1', 'self-review-trigger.sh',
   'semantic-density-audit.ps1', 'semantic-density-audit.sh',
   'subagent-stop-review.ps1', 'subagent-stop-review.sh',
-  'self-review.md',
   'biome-advisory.ps1', 'biome-advisory.sh',
   'semgrep-advisory.ps1', 'semgrep-advisory.sh',
   'anchor-set-nudge.ps1', 'anchor-set-nudge.sh',
   'minimal-edit-audit.ps1', 'minimal-edit-audit.sh',
+  'cleanup-doctrine.md', 'self-review.md',
 ];
 
-// Doctrine files removed from the sessionStart payload across versions.
-const STALE_CURSOR_FILES = ['pre-compile.md', 'USER-RULES.md', 'declared-editing.md'];
+const LEGACY_CURSOR_FILES = [
+  'inject-doctrine.ps1', 'inject-doctrine.sh',
+  'doctrine.md', 'pre-compile.md', 'USER-RULES.md', 'declared-editing.md',
+];
 
-function payloadHookFiles() {
-  return readdirSync(join(payload, 'hooks'));
-}
-
-// An entry in hooks.json is "ours" when its command references one of the
-// script filenames we ship (hook scripts or the inject-doctrine script).
 function ourKeys() {
-  return [...payloadHookFiles().filter((f) => !f.endsWith('.md')), injectName];
+  return readdirSync(hooksSrc).filter((f) => f.endsWith('.mjs'));
 }
 
 function commandReferencesOurPath(command, key) {
   if (typeof command !== 'string') return false;
   const c = command.replaceAll('\\', '/').toLowerCase();
   const k = key.toLowerCase();
-  if (k === injectName.toLowerCase()) {
-    return c.includes(`~/.cursor/${k}`) || c.includes(`/.cursor/${k}`);
-  }
   return c.includes(`~/.agents/hooks/${k}`) || c.includes(`/.agents/hooks/${k}`);
 }
 
@@ -93,37 +79,17 @@ function keyOf(command, keys) {
   return keys.find((k) => commandReferencesOurPath(command, k));
 }
 
-// Detect a STALE entry from a prior install: its command names one of the hook
-// scripts THIS pack used to ship but no longer does (the explicit STALE_HOOK_FILES
-// roster — e.g. anchor-set-nudge / minimal-edit-audit, deleted in 0.5.0). The old
-// merge preserved them as "foreign", so deleted hooks kept running on every edit
-// silently. Returning true here makes install reap them.
-//
-// Gate on the KNOWN roster, not "any *.ps1/*.sh not in the current payload":
-// a user's own hook (~/.agents/hooks/my-custom-gate.ps1) also matches the
-// filename shape and is NOT in the payload, so the old broad check reaped it on
-// every install — dropping a genuinely foreign entry and, once it was the only
-// foreign entry, making uninstall delete hooks.json outright. STALE_HOOK_FILES
-// already lists every orphan this pack ever shipped, so the narrow check still
-// reaps all legacy hooks while leaving foreign entries untouched.
-const HOOK_FILENAME_RE = /([\w.\-]+)\.(ps1|sh)\b/;
-const INJECT_RE = /\binject-doctrine\.(ps1|sh)\b/;
+const LEGACY_CMD_RE = /([\w.\-]+)\.(ps1|sh)\b/;
 function isStaleOurs(command) {
   if (typeof command !== 'string') return false;
-  const hookMatch = command.match(HOOK_FILENAME_RE);
-  if (hookMatch) {
-    const fname = `${hookMatch[1]}.${hookMatch[2]}`;
-    // Only OUR retired hooks are stale. A name we never shipped is foreign —
-    // leave it. A name still in the payload is current ours (handled elsewhere).
-    return STALE_HOOK_FILES.includes(fname);
-  }
-  if (INJECT_RE.test(command)) {
-    return !doctrineFiles.includes(injectName);
+  const m = command.match(LEGACY_CMD_RE);
+  if (m) {
+    const fname = `${m[1]}.${m[2]}`;
+    return LEGACY_HOOK_FILES.includes(fname) || LEGACY_CURSOR_FILES.includes(fname);
   }
   return false;
 }
 
-// declared: best-effort verify fixture cleanup; EBUSY on locked temp dirs may still throw on Windows
 function rmBestEffort(path, opts = { force: true }) {
   if (existsSync(path)) rmSync(path, opts);
 }
@@ -141,11 +107,6 @@ function mergeHooks(existing, incoming, keys) {
       if (i >= 0) cur[i] = entry;
       else cur.push(entry);
     }
-    // Reap stale ours entries from prior installs BEFORE treating anything as
-    // foreign. isStaleOurs catches commands referencing scripts this pack no
-    // longer ships (e.g. anchor-set-nudge / minimal-edit-audit, deleted in
-    // 0.5.0). Without this, deleted hooks kept running silently on every edit
-    // because the merge mistook them for user-added foreign entries.
     const live = cur.filter((x) => x && !isStaleOurs(x.command));
     const foreign = live.filter((x) => x && !isOurs(x.command, keys));
     const reordered = [];
@@ -154,10 +115,7 @@ function mergeHooks(existing, incoming, keys) {
       const k = keyOf(entry.command, keys);
       if (!k || !isOurs(entry.command, keys)) continue;
       const found = live.find((x) => x && keyOf(x.command, keys) === k);
-      if (found) {
-        reordered.push(found);
-        used.add(k);
-      }
+      if (found) { reordered.push(found); used.add(k); }
     }
     for (const x of live) {
       const k = keyOf(x?.command, keys);
@@ -165,11 +123,6 @@ function mergeHooks(existing, incoming, keys) {
     }
     out.hooks[event] = [...reordered, ...foreign];
   }
-  // Final sweep: reap stale-ours entries from ALL events, including those that
-  // exist only in the prior config (e.g. afterFileEdit / postToolUse /
-  // subagentStop when the new pack no longer ships hooks for those events).
-  // The main loop above only touches events present in `incoming`, so without
-  // this pass deleted hooks from a prior install would survive the merge.
   for (const event of Object.keys(out.hooks)) {
     if (!Array.isArray(out.hooks[event])) continue;
     out.hooks[event] = out.hooks[event].filter((x) => x && !isStaleOurs(x.command));
@@ -182,40 +135,22 @@ function mergeHooks(existing, incoming, keys) {
   return { merged: out, preserved };
 }
 
-// Remove every file and hooks.json entry this pack owns. Used by uninstall()
-// and at the start of install() so `npx cursordoctrine@latest install` always
-// upgrades from a clean slate (foreign hooks.json entries are preserved).
 function removeOurPack() {
   const removed = [];
   const keys = ourKeys();
+  const shipped = readdirSync(hooksSrc).filter((f) => !f.startsWith('__pycache__'));
 
-  for (const f of payloadHookFiles()) {
+  for (const f of shipped) {
     const p = join(hooksDst, f);
-    if (existsSync(p)) {
-      rmSync(p, { force: true });
-      removed.push(`~/.agents/hooks/${f}`);
-    }
+    if (existsSync(p)) { rmSync(p, { force: true }); removed.push(`~/.agents/hooks/${f}`); }
   }
-  for (const f of STALE_HOOK_FILES) {
+  for (const f of LEGACY_HOOK_FILES) {
     const p = join(hooksDst, f);
-    if (existsSync(p)) {
-      rmSync(p, { force: true });
-      removed.push(`~/.agents/hooks/${f}`);
-    }
+    if (existsSync(p)) { rmSync(p, { force: true }); removed.push(`~/.agents/hooks/${f}`); }
   }
-  for (const f of doctrineFiles) {
+  for (const f of LEGACY_CURSOR_FILES) {
     const p = join(cursorDst, f);
-    if (existsSync(p)) {
-      rmSync(p, { force: true });
-      removed.push(`~/.cursor/${f}`);
-    }
-  }
-  for (const f of STALE_CURSOR_FILES) {
-    const p = join(cursorDst, f);
-    if (existsSync(p)) {
-      rmSync(p, { force: true });
-      removed.push(`~/.cursor/${f}`);
-    }
+    if (existsSync(p)) { rmSync(p, { force: true }); removed.push(`~/.cursor/${f}`); }
   }
   if (existsSync(skillDst)) {
     rmSync(skillDst, { recursive: true, force: true });
@@ -245,51 +180,33 @@ function removeOurPack() {
         writeFileSync(hooksJsonDst, JSON.stringify(existing, null, 2) + '\n');
         removed.push(`~/.cursor/hooks.json (ours stripped, ${foreign} foreign entr${foreign === 1 ? 'y' : 'ies'} kept)`);
       }
-    } catch {
-      // Invalid JSON left for install() to back up and rewrite.
-    }
+    } catch { /* unreadable: leave untouched */ }
   }
 
   return removed;
 }
 
 function install() {
-  console.log(`cursordoctrine ${pkg.version} — installing the ${platform} hook pack into ${HOME}`);
-  if (process.platform === 'darwin') {
-    console.log('  note: macOS detected — installing the Linux (bash) hook pack.');
-  }
+  console.log(`cursordoctrine ${pkg.version} — installing the Node hook pack into ${HOME}`);
   const removedPrior = removeOurPack();
-  if (removedPrior.length) {
-    console.log(`  removed prior install  ${removedPrior.length} item(s)`);
-  }
+  if (removedPrior.length) console.log(`  removed prior install  ${removedPrior.length} item(s)`);
 
   mkdirSync(hooksDst, { recursive: true });
   mkdirSync(cursorDst, { recursive: true });
 
-  const hookFiles = payloadHookFiles();
-  for (const f of hookFiles) cpSync(join(payload, 'hooks', f), join(hooksDst, f));
+  cpSync(hooksSrc, hooksDst, {
+    recursive: true,
+    filter: (src) => !src.includes('__pycache__'),
+  });
 
-  for (const f of doctrineFiles) cpSync(join(payload, f), join(cursorDst, f));
-
-  if (platform === 'linux') {
-    for (const f of hookFiles) {
-      if (f.endsWith('.sh')) chmodSync(join(hooksDst, f), 0o755);
-    }
-    chmodSync(join(cursorDst, injectName), 0o755);
-  }
-
-  // hooks.json: pwsh -File does not expand ~, so substitute the real profile
-  // path (forward slashes) on Windows — same as INSTALL.md. Bash expands ~.
-  let text = readFileSync(join(payload, 'hooks.json'), 'utf8');
-  const incoming = JSON.parse(text);
-  if (platform === 'windows') {
+  const incoming = JSON.parse(readFileSync(hooksJsonSrc, 'utf8'));
+  if (process.platform === 'win32') {
     const homeFwd = HOME.replaceAll('\\', '/');
     for (const entries of Object.values(incoming.hooks || {})) {
       if (!Array.isArray(entries)) continue;
       for (const entry of entries) {
         if (entry && typeof entry.command === 'string') {
-          entry.command = entry.command.replace(/-File ~\/([^\s"]+)/g, `-File "${homeFwd}/$1"`);
-          entry.command = entry.command.replace(/-File "~\/([^"]+)"/g, `-File "${homeFwd}/$1"`);
+          entry.command = entry.command.replace(/~\/agents\/hooks\//g, `${homeFwd}/.agents/hooks/`);
         }
       }
     }
@@ -321,9 +238,9 @@ function install() {
     filter: (src) => !src.includes('__pycache__'),
   });
 
+  const hookFiles = readdirSync(hooksDst);
   console.log('');
-  console.log(`  ~/.agents/hooks        ${hookFiles.length} files`);
-  console.log(`  ~/.cursor              ${doctrineFiles.join(', ')}`);
+  console.log(`  ~/.agents/hooks        ${hookFiles.length} files (Node engine + payloads)`);
   console.log(`  ~/.cursor/hooks.json   ${hooksJsonNote}`);
   console.log('  ~/.cursor/skills       anti-slop (SKILL.md + scanner)');
   console.log('');
@@ -338,20 +255,14 @@ function install() {
 
 function prereqProblems() {
   const problems = [];
-  if (platform === 'windows') {
-    if (!canRun('pwsh.exe', ['-NoProfile', '-Command', 'exit 0'])) {
-      problems.push('PowerShell 7 (pwsh) not found on PATH — the hooks will not run until it is installed.');
-    }
-  } else {
-    if (!canRun('bash', ['-c', 'exit 0'])) {
-      problems.push('bash not found — the hooks will not run until it is installed.');
-    }
-    if (!canRun('jq', ['--version']) && !canRun('python3', ['-c', ''])) {
-      problems.push('neither jq nor python3 found — install one (the hooks prefer jq).');
-    }
+  if (!canRun('node', ['--version'])) {
+    problems.push('node not found on PATH — the hooks will not run until it is installed.');
   }
   if (!pythonCmd()) {
-    problems.push('Python 3.9+ not found — the anti-slop scanner is unavailable (the final review falls back to the checklist).');
+    problems.push('Python 3.9+ not found — the anti-slop scanner and minimality metric are unavailable.');
+  }
+  if (!canRun('git', ['--version'])) {
+    problems.push('git not found on PATH — scope-git-sweep and final-review diff/numstat are unavailable.');
   }
   return problems;
 }
@@ -362,29 +273,24 @@ function canRun(cmd, args) {
 }
 
 function pythonCmd() {
-  for (const c of platform === 'windows' ? ['python', 'python3', 'py'] : ['python3', 'python']) {
+  for (const c of process.platform === 'win32' ? ['python', 'python3', 'py'] : ['python3', 'python']) {
     if (canRun(c, ['-c', ''])) return c;
   }
   return undefined;
 }
 
 function runHook(file, payloadObj) {
-  const cmd = platform === 'windows' ? ['pwsh.exe', '-NoProfile', '-File', file] : ['bash', file];
-  const r = spawnSync(cmd[0], cmd.slice(1), {
+  const r = spawnSync('node', [file], {
     input: JSON.stringify(payloadObj),
     encoding: 'utf8',
     timeout: 20000,
     windowsHide: true,
-    // Hooks resolve state under $HOME; pin it (and USERPROFILE, which pwsh
-    // derives $HOME from) so sandboxed verify runs stay self-contained.
     env: { ...process.env, HOME, USERPROFILE: HOME },
   });
   if (r.error) return `spawn error: ${r.error.message}`;
   return `${r.stdout || ''}${r.stderr || ''}`.trim();
 }
 
-// package.json is load-bearing: step0-gate gates on is_project_root, so the
-// sandbox must look like a project or the gate short-circuits before the scope check.
 function withScopeSandbox(name, scopeObj, fn) {
   const repoDir = join(HOME, name);
   const scopePath = join(repoDir, '.scope.json');
@@ -398,23 +304,23 @@ function withScopeSandbox(name, scopeObj, fn) {
     rmBestEffort(repoDir, { recursive: true, force: true });
   }
 }
+
 function verify() {
   runVerify({
     HOME,
-    platform,
     pkg,
+    hooksSrc,
     hooksDst,
     hooksJsonDst,
+    hooksJsonSrc,
     pendingDir,
     cursorDst,
-    injectName,
-    payload,
     pkgRoot,
     skillDst,
     runHook,
     withScopeSandbox,
     ourKeys,
-    STALE_HOOK_FILES,
+    LEGACY_HOOK_FILES,
     rmBestEffort,
     mergeHooks,
     pythonCmd,
@@ -422,19 +328,6 @@ function verify() {
   });
 }
 
-// Whole-codebase anti-slop sweep. Runs the scanner in AUDIT mode (--all) and
-// prints a structured, category-by-category breakdown of every slop signal in
-// the repo. This is the COMPREHENSIVE counterpart to the bounded session
-// final-review: it explicitly authorizes fixing pre-existing slop (the session
-// review forbids that, correctly). The scanner is reports-only and never edits;
-// this command is too — it hands the deterministic inventory plus a cleanup
-// doctrine to the agent, which iterates scan->fix->re-scan until clean.
-//
-// Why scan-only here: the scanner is deliberately dumb and high-precision
-// (it refuses to guess semantic slop). The fixing needs judgement (is a clone
-// load-bearing? is a swallowed error a legit best-effort cleanup?), which is
-// the model's job, not a script's. The doctrine pins the order and the
-// re-scan-after-each-category loop so the agent can't drift.
 function sweep() {
   const root = resolve(process.argv[3] || '.');
   console.log(`cursordoctrine ${pkg.version} — anti-slop sweep (whole codebase)`);
@@ -452,12 +345,9 @@ function sweep() {
   const py = pythonCmd();
   if (!py) {
     console.error('Python 3.9+ not found — the scanner cannot run.');
-    console.error('Install Python, then re-run.');
     process.exit(1);
   }
 
-  // --all --format json: the deterministic inventory. --format json so we can
-  // parse totals + group signals by category for a readable report.
   const r = spawnSync(py, [scanner, '--all', '--format', 'json', '--root', root], {
     encoding: 'utf8',
     timeout: 120000,
@@ -471,7 +361,7 @@ function sweep() {
   let data;
   try {
     data = JSON.parse(`${r.stdout || ''}`);
-  } catch (e) {
+  } catch {
     console.error('scanner produced unparseable output.');
     if (r.stderr) console.error(r.stderr);
     process.exit(1);
@@ -493,8 +383,6 @@ function sweep() {
     return;
   }
 
-  // Group per-file signals by category, mapping scanner keys to human labels.
-  // Order matches the cleanup doctrine (cheapest/highest-precision first).
   const categories = [
     ['swallowed_errors', 'SWALLOWED ERRORS', 'empty catch / broad except+pass'],
     ['abstractions', 'PREMATURE ABSTRACTIONS', 'Factory/Repository/CQRS with <2 call sites'],
@@ -530,12 +418,10 @@ function sweep() {
     console.log('');
   }
 
-  // Duplication block (the isRecord-class slop). The doctrine orders these first;
-  // we print them after per-file only because the summary count rolls them up.
   const dupCount = (dup.name_clones?.length || 0) + (dup.body_clones?.length || 0)
     + (dup.near_clones?.length || 0) + (dup.single_use?.length || 0)
     + (dup.type_clones?.length || 0);
-  if (dupCount || dup.fingerprints && Object.keys(dup.fingerprints).length) {
+  if (dupCount || (dup.fingerprints && Object.keys(dup.fingerprints).length)) {
     console.log('DUPLICATION (isRecord-class slop):');
     const dupRows = [
       ['name_clones', 'Clone proliferation', 'same name in >=2 files'],
@@ -566,16 +452,11 @@ function sweep() {
     console.log('');
   }
 
-  // Summary counts for a one-line read.
   const parts = [];
   for (const [k, label] of categories) if (totals[k]) parts.push(`${totals[k]} ${label.toLowerCase().replace(/ /g, '-')}`);
   console.log(`SUMMARY (audit): ${parts.join(', ') || 'no per-file slop signals'}`);
   console.log('');
 
-  // Hand off to the agent. The cleanup doctrine pins the order and the
-  // scan->fix->re-scan loop; the scanner stays the deterministic source of
-  // truth ("STILL failing?" == "not fixed"). Bounded by the agent's own loop
-  // limit; this command is a single deterministic pass.
   const doctrine = join(hooksDst, 'cleanup-doctrine.md');
   const doctrineExists = existsSync(doctrine);
   const scanAgain = `${py} ${scanner.replaceAll('\\', '/')} --all --root .`;
@@ -592,18 +473,8 @@ function sweep() {
 }
 
 function uninstall() {
-  console.log(`cursordoctrine ${pkg.version} — removing the ${platform} hook pack from ${HOME}`);
-
+  console.log(`cursordoctrine ${pkg.version} — removing the Node hook pack from ${HOME}`);
   const removed = removeOurPack();
-
-  if (existsSync(hooksJsonDst)) {
-    try {
-      JSON.parse(readFileSync(hooksJsonDst, 'utf8'));
-    } catch {
-      console.log('  warning: ~/.cursor/hooks.json is not valid JSON — left untouched.');
-    }
-  }
-
   console.log('');
   for (const r of removed) console.log(`  removed  ${r}`);
   if (removed.length === 0) console.log('  nothing to remove.');
@@ -618,7 +489,7 @@ Usage
   npx cursordoctrine <command>
 
 Commands
-  install      Install the hook pack, doctrine, and anti-slop skill into $HOME.
+  install      Install the Node hook pack, doctrine, and anti-slop skill into $HOME.
                Removes any prior cursordoctrine install first, then writes fresh.
                Merges ~/.cursor/hooks.json — entries you added yourself are preserved.
   verify       Smoke-test every installed hook with fake payloads (no Cursor restart needed).

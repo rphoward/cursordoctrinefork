@@ -27,24 +27,19 @@ Ten agent hooks plus `inject-doctrine` across seven events. No state machine the
 4. **Track the blast radius** at `afterFileEdit` + `postToolUse` — `scope-refresh` records each edited file into `files[]` and stashes a one-line reminder; `scope-drain` delivers it as `additional_context` on the next tool boundary. `scope-git-sweep` catches Shell-written files into `files[]` using a post-session-start mtime filter (only paths modified after `sessionStart`). Fires on ALL file edits (Write, Edit, MultiEdit, ApplyPatch, etc.), not just `Write`. Keeps the contract visible as a turn fills with code.
 5. **Mid-session milestone verify (doctrine-ultra)** at `postToolUse` — `milestone-verify` runs after `scope-drain`. When the agent declares a `decomposition[]` at Step 0 (Thinker) and a step's `expected_files` are all touched without a recorded verdict, it emits `VERIFY MILESTONE step N` as `additional_context`. The agent types `ACCEPT step N` or `REVISE step N: <diagnosis>` in chat; the hook scrapes the transcript and writes the verdict into `.scope.json`'s `verifications[]`. Tri-role (Trinity-style): Thinker=decomposition at Step 0, Worker=edits, Verifier=this hook + final-review axis 7. Trivial one-liners (YAGNI rung 1) leave `decomposition[]` empty and the hook stays silent.
 6. **Intent anchor (persistent contract nudge)** at `postToolUse` — `intent-anchor` re-fires when the contract is incomplete and either this conversation has never been nudged or new files were edited since the last nudge. The per-cid flag stores `filesCount:nudgeCount`. Capped at 99999 nudges per conversation (effectively unlimited). Once both fields are filled, it goes silent permanently for that conversation.
-7. **Gate blast radius** at `beforeShellExecution` — one permission gate denies a short explicit list of dangerous commands (`rm -rf /`, `curl | sh`, force-push, `npm publish`, ...). The script fails open on internal errors; `failClosed: false` so a pwsh cold-start abort does not block all shell use. Everything else passes.
+7. **Gate blast radius** at `beforeShellExecution` — one permission gate denies a short explicit list of dangerous commands (`rm -rf /`, `curl | sh`, force-push, `npm publish`, ...). The script fails open on internal errors; `failClosed: false` so a node cold-start abort does not block all shell use. Everything else passes.
 8. **One final review** at `stop` — when an implementation finishes and `git` sees changed files (or `.scope.json` `files[]` has entries for non-git projects), Cursor auto-submits one `FINAL REVIEW` follow-up. Saved Cursor plans under `.cursor/plans/**` are ignored. **Eight axes with a structured bullet report** (the model emits `- **N Axis**: PASS | FAIL — reason` per axis, then `**Verdict**: ACCEPT | REVISE`). If the agent revises based on the review, the hook detects the diff changed and re-reviews the new diff. This verify-revise-reverify cycle repeats until the diff stabilizes or `loop_limit: 3` is hit. The hook reads `git diff --name-only HEAD` + untracked files (falls back to `.scope.json` `files[]` for non-git projects); the only state is a per-conversation brake flag storing a content-hash signature of the change surface.
 
 The model is the auditor. A self-review done by the model in its own context is free — it has the file, the diff, the user's intent, and the ability to fix. The harness's two hard levers are **step0-gate** (no code edits without a persisted contract) and the **permission gate** (no irreversible shell).
 
 ## Prerequisites
 
-> **PowerShell 7 (`pwsh`) is required on Windows.** The hooks run via `pwsh.exe -NoProfile -File ...`. Windows PowerShell 5.1 (`powershell.exe`) is not supported — install PowerShell 7 separately.
-
 | Platform | Required | Optional (recommended) |
 |---|---|---|
-| **Windows** | `git`, **PowerShell 7 (`pwsh`) on PATH** | Python 3.9+ (powers the sweep scanner) |
-| **Linux / SSH remotes** | `bash`, `git`, and `jq` **or** `python3` | Python 3.9+ (sweep scanner) |
+| **Windows** | `node` 18+, `git` | Python 3.9+ (powers the sweep scanner + minimality metric) |
+| **Linux / SSH remotes** | `node` 18+, `git` | Python 3.9+ (sweep scanner + minimality metric) |
 
-Install PowerShell 7:
-
-- **Windows**: `winget install --id Microsoft.PowerShell --source winget` (or grab the MSI from the [PowerShell GitHub releases](https://github.com/PowerShell/PowerShell/releases)). Confirm with `pwsh -Version`.
-- **Linux**: follow the [official package instructions](https://learn.microsoft.com/en-us/powershell/scripting/install/installing-powershell-on-linux) — only needed if you run the `windows/` pack on a Linux box (unusual); normal Linux installs use the `linux/` bash pack.
+One engine, every platform. The hooks run via `node ~/.agents/hooks/<name>.mjs`, so the only hard requirement is Node 18+ and `git`. Python unlocks the anti-slop scanner (`cursordoctrine sweep`) and the minimality metric in the final review; both fail open when Python is absent.
 
 ## Install
 
@@ -56,7 +51,7 @@ npx cursordoctrine verify           # smoke-tests every hook with fake payloads,
 npx cursordoctrine sweep            # whole-codebase anti-slop audit + fix-handoff (on demand)
 ```
 
-Restart Cursor after install — `hooks.json` is read at startup. `install` is idempotent; re-run to update. Entries you added to `~/.cursor/hooks.json` yourself are kept. `npx cursordoctrine uninstall` removes the pack the same way. **Re-running `install` after upgrading to 1.0 also reaps the old hooks** (intent-precompile, intent-anchor, self-review-trigger, etc.) from your existing `hooks.json` automatically.
+Restart Cursor after install — `hooks.json` is read at startup. `install` is idempotent; re-run to update. Entries you added to `~/.cursor/hooks.json` yourself are kept. `npx cursordoctrine uninstall` removes the pack the same way. **Re-running `install` after upgrading to 1.6 also reaps the legacy `windows/` (`.ps1`) and `linux/` (`.sh`) hook packs** plus retired keys (self-review-trigger, etc.) from your existing `hooks.json` automatically.
 
 No Node? Open `INSTALL.md`, paste it into a Cursor agent chat on the target machine, and let the agent copy files and run the checklist.
 
@@ -82,25 +77,24 @@ The anti-slop skill (`skills/anti-slop/` — `SKILL.md` and the duplication scan
 ## Layout
 
 ```
-windows/          PowerShell 7 hooks (pwsh) — install on Windows machines
-  hooks.json      6-event hook wiring for ~/.cursor/hooks.json
-  inject-doctrine.ps1, doctrine.md
-  hooks/          intent-precompile.ps1, step0-gate.ps1, scope-refresh.ps1, scope-drain.ps1,
-                  milestone-verify.ps1, intent-anchor.ps1, permission-gate.ps1,
-                  final-review.ps1, hook-common.ps1 (shared)
-                  + 3 prompt files: anti-slop.md, final-review.md, cleanup-doctrine.md
-linux/            bash hooks — install on Linux machines and SSH remotes
-  hooks.json, inject-doctrine.sh, doctrine.md
-  hooks/          same hooks, ported to bash (jq preferred, python3 fallback)
+hooks/            the single Node engine — one .mjs per hook, shared modules
+  hook-common.mjs       shared lib: stdin/stdout, path utils, transcript scrape, git, minimality
+  contract-store.mjs    owns the .scope.json shape (read/write/merge/verdict, atomic locks)
+  session-state.mjs     owns ~/.cursor/.hooks-pending files (stash, nudge, session stamp, sweep)
+  intent-precompile.mjs, step0-gate.mjs, scope-refresh.mjs, scope-drain.mjs,
+  scope-git-sweep.mjs, milestone-verify.mjs, intent-anchor.mjs,
+  permission-gate.mjs, final-review.mjs, inject-doctrine.mjs
+  doctrine.md, final-review.md, minimality.py   payload files resolved next to the engine
+hooks.json        7-event hook wiring (node ~/.agents/hooks/<name>.mjs)
 skills/           Cursor agent skills shipped with the package
   anti-slop/      SKILL.md + the duplication scanner (`cursordoctrine sweep` runs it)
-                  scripts/scan_slop.py, low_density.py
-bin/              the npm CLI (npx cursordoctrine install / verify / sweep / uninstall)
+                  scripts/scan_slop.py, low_density.py, _language.py (shared leaf)
+bin/              the npm CLI (install / verify / sweep / uninstall) + verify fixture + checks/
 INSTALL.md        ready-to-paste prompt that tells a Cursor agent to
-                  install the right folder and verify every hook
+                  install the pack and verify every hook
 ```
 
-Both folders do the same thing. Windows runs everything through `pwsh.exe` (PowerShell 7 — Windows PowerShell 5.1 is not supported). Linux runs bash, which is what you want on a remote over SSH (check your `~/.ssh/config` host — hooks live on the remote's `$HOME`, not your laptop).
+One engine, every platform — no `windows/` vs `linux/` split, no parity checks. The installer copies `hooks/` to `~/.agents/hooks/` and merges `hooks.json` into `~/.cursor/hooks.json`.
 
 ## Tuning and kill switches
 
