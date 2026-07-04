@@ -1,15 +1,16 @@
 {
-  "name": "cursordoctrine",
-  "version": "2.0.0",
-  "description": "Cursor hooks: doctrine at session start, intent-precompile (.scope.json), Step 0 hard gate, scope refresh/drain, mid-session milestone verify, permission gate, final review at stop.",
+  "name": "cursordoctrine-lite",
+  "version": "3.0.0",
+  "description": "Cursor hook pack lite: doctrine at session start, Step 0 hard gate on writes, shell deny-list without force-push, one final review at stop.",
   "bin": {
     "cursordoctrine": "bin/cli.mjs"
   },
   "type": "module",
   "scripts": {
-    "test": "node bin/cli.mjs install && node bin/cli.mjs verify",
+    "test": "node bin/cli.mjs verify",
     "verify": "node bin/cli.mjs verify",
-    "sweep": "node bin/cli.mjs sweep"
+    "install": "node bin/cli.mjs install",
+    "uninstall": "node bin/cli.mjs uninstall"
   },
   "engines": {
     "node": ">=18"
@@ -18,11 +19,11 @@
     "bin/",
     "hooks/",
     "hooks.json",
-    "skills/anti-slop/",
-    "docs/AUDIT-PROMPT.md",
-    "docs/MCP.md",
-    "docs/USER-RULES.md",
+    "docs/",
     "INSTALL.md",
+    "README.md",
+    "HOOKS.md",
+    "GLOBAL-RULES.md",
     "!**/__pycache__",
     "!**/*.pyc",
     "!**/*.pyo"
@@ -42,9 +43,7 @@
     "agent",
     "ai-agents",
     "self-review",
-    "anti-slop",
-    "code-review",
-    "cli"
+    "code-review"
   ],
   "author": "Mario Pulice (kleosr)",
   "license": "MIT"

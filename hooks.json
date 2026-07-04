@@ -1,12 +1,6 @@
 {
   "version": 1,
   "hooks": {
-    "beforeSubmitPrompt": [
-      {
-        "command": "node ~/.agents/hooks/intent-precompile.mjs",
-        "timeout": 5
-      }
-    ],
     "sessionStart": [
       {
         "command": "node ~/.agents/hooks/inject-doctrine.mjs",
@@ -19,30 +13,6 @@
         "matcher": "Write|StrReplace|ApplyPatch|Edit|MultiEdit|Replace",
         "timeout": 5,
         "failClosed": false
-      }
-    ],
-    "afterFileEdit": [
-      {
-        "command": "node ~/.agents/hooks/scope-refresh.mjs",
-        "timeout": 5
-      }
-    ],
-    "postToolUse": [
-      {
-        "command": "node ~/.agents/hooks/scope-drain.mjs",
-        "timeout": 5
-      },
-      {
-        "command": "node ~/.agents/hooks/scope-git-sweep.mjs",
-        "timeout": 5
-      },
-      {
-        "command": "node ~/.agents/hooks/milestone-verify.mjs",
-        "timeout": 5
-      },
-      {
-        "command": "node ~/.agents/hooks/intent-anchor.mjs",
-        "timeout": 5
       }
     ],
     "beforeShellExecution": [

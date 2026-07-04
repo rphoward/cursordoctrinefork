@@ -1,106 +1,124 @@
-import {
-  readHookStdinJson, runHookMain, resolveProjectRoot, scopeRelativeAnyRoot,
-} from './hook-common.mjs';
-import { readScope, scopePathFor, intentNeedsStep0, realFiles } from './contract-store.mjs';
+#!/usr/bin/env node
 
-const EDIT_TOOLS = new Set(['Write', 'StrReplace', 'ApplyPatch', 'Edit', 'MultiEdit', 'Replace']);
-const PATH_KEYS = ['path', 'file_path', 'filename', 'absolute_path', 'abs_path', 'target_file'];
+import { existsSync, readFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-function allow() {
-  return { permission: 'allow' };
+const HOOKS_DIR = dirname(fileURLToPath(import.meta.url));
+
+function resolveProjectRoot(cwd, workspaceRoots) {
+  const tries = [
+    cwd,
+    ...(Array.isArray(workspaceRoots) ? workspaceRoots : Array.isArray(workspaceRoots) ? workspaceRoots : []).filter(Boolean),
+    process.env.CURSOR_PROJECT_DIR || '',
+    process.env.PWD || ''
+  ];
+  for (const candidate of tries) {
+    if (!candidate) continue;
+    const root = resolve(candidate);
+    if (existsSync(join(root, '.git')) || existsSync(join(root, '.scope.json'))) return root;
+  }
+  return resolve(cwd || '.');
 }
 
-function deny(reason) {
-  const userMsg =
-    `BLOCKED by step0-gate: ${reason}\n\n` +
-    'Write intent (+ decomposition[] for multi-file tasks) to .scope.json first, then retry.';
-  return {
-    permission: 'deny',
-    user_message: userMsg,
-    agent_message: `${userMsg} Do not skip Step 0 — persist the contract to .scope.json, not chat prose.`,
-  };
+const EDIT_RE = /\b(Write|Edit|MultiEdit|Replace|StrReplace|ApplyPatch)\b/i;
+function looksLikeWrite(input) {
+  return typeof input === 'object' && EDIT_RE.test((input && input.tool_name) || '');
 }
 
-function countDecomposition(scope) {
-  const decomp = Array.isArray(scope?.decomposition) ? scope.decomposition : [];
-  let count = 0;
-  for (const d of decomp) {
-    if (!d) continue;
-    const sub = typeof d === 'string' ? d : (d?.subtask ?? '');
-    if (typeof sub === 'string' && sub.trim() !== '' && !/^\s*<TODO/.test(sub)) count++;
-  }
-  return count;
+function extractTarget(input) {
+  if (!input || typeof input !== 'object') return '';
+  return [input.file_path, input.path, input.uri].find(Boolean) || '';
 }
 
-function filesLowerMap(scope) {
-  const map = new Set();
-  for (const f of realFiles(scope?.files ?? [])) {
-    map.add(f.replace(/\\/g, '/').replace(/^\//, '').toLowerCase());
+function relativeTarget(target, root) {
+  if (!target || !root) return target;
+  const norm = resolve(target);
+  if (norm.length < root.length) return target;
+  if (norm === root || norm.startsWith(`${root}/`) || norm.startsWith(`${root}\\`)) {
+    const rel = norm.slice(root.length).replace(/^[/\\]+/, '');
+    return rel ? rel.split(/[/\\]+/).map(encodeURIComponent).join('/') : '';
   }
-  return map;
+  return target;
 }
 
-function extractTargetPaths(toolInput) {
-  const out = [];
-  if (!toolInput || typeof toolInput !== 'object') return out;
-  for (const k of PATH_KEYS) {
-    if (toolInput[k]) out.push(String(toolInput[k]));
+function loadScope(scopePath) {
+  try {
+    return JSON.parse(readFileSync(scopePath, 'utf8'));
+  } catch {
+    return null;
   }
-  const edits = Array.isArray(toolInput.edits) ? toolInput.edits : [];
-  for (const edit of edits) {
-    if (!edit || typeof edit !== 'object') continue;
-    for (const k of PATH_KEYS) {
-      if (edit[k]) { out.push(String(edit[k])); break; }
-    }
-  }
-  return out;
 }
 
-export function run(obj) {
-  if (process.env.HOOKS_ENFORCE === '0' || process.env.STEP0_GATE_ENFORCE === '0') return allow();
-
-  if (!obj) return allow();
-
-  const toolName = typeof obj.tool_name === 'string' ? obj.tool_name : '';
-  if (toolName && !EDIT_TOOLS.has(toolName)) return allow();
-
-  const root = resolveProjectRoot(obj);
-  if (!root) return allow();
-
-  const scopePath = scopePathFor(root);
-  const scope = readScope(scopePath);
-  if (!scope) return allow();
-
-  const intentEmpty = intentNeedsStep0(scope.intent);
-  const realCount = realFiles(scope.files ?? []).length;
-  const filesLower = filesLowerMap(scope);
-  const decompCount = countDecomposition(scope);
-
-  const rawTi = obj.tool_input;
-  let ti = rawTi;
-  if (typeof rawTi === 'string') {
-    try { ti = JSON.parse(rawTi); } catch { ti = null; }
-  }
-  const targetPaths = extractTargetPaths(ti);
-
-  if (targetPaths.length === 0) {
-    if (intentEmpty) return deny('edit tool target path could not be parsed and intent is empty — fill .scope.json before editing.');
-    if (realCount >= 1 && decompCount === 0) return deny('edit tool target path could not be parsed and decomposition[] is empty after prior file edits.');
-    return allow();
-  }
-
-  for (const targetPath of targetPaths) {
-    const rel = scopeRelativeAnyRoot(targetPath, obj);
-    if (!rel) return deny('edit target is outside all workspace roots or could not be normalized.');
-    if (rel.toLowerCase() === '.scope.json') continue;
-    if (intentEmpty) return deny('intent is empty — write your one-line Step 0 restatement to .scope.json before editing code.');
-    const alreadyRecorded = filesLower.has(rel.toLowerCase());
-    if (!alreadyRecorded && realCount >= 1 && decompCount === 0) {
-      return deny('about to edit a second distinct file and decomposition[] is empty — declare steps in .scope.json before editing another file.');
-    }
-  }
-
-  return allow();
+function availableFields(intent, decomposition, files) {
+  const missing = [];
+  const hasIntent = typeof intent === 'string' && intent.trim().length > 0;
+  const hasDecomposition = Array.isArray(decomposition) && decomposition.length > 0;
+  const hasFiles = Array.isArray(files) && files.some(f => typeof f === 'string' && f.trim() !== '' && f !== '.scope.json');
+  if (!hasIntent) missing.push('intent');
+  if (!hasDecomposition && hasFiles) missing.push('decomposition');
+  return missing;
 }
 
-runHookMain(run, import.meta.url);
+async function readInput() {
+  const chunks = [];
+  for await (const chunk of process.stdin) chunks.push(chunk);
+  const raw = Buffer.concat(chunks).toString('utf8').trim();
+  if (!raw) return {};
+  try { return JSON.parse(raw); } catch { return {}; }
+}
+
+async function main() {
+  const payload = readInput();
+  if (process.env.STEP0_GATE_ENFORCE === '0') {
+    console.log(JSON.stringify({ permission: 'allow' }, null, 2));
+    return;
+  }
+
+  const root = resolveProjectRoot(payload.cwd, payload.workspace_roots);
+  const scopePath = join(root, '.scope.json');
+  if (!existsSync(scopePath)) {
+    console.log(JSON.stringify({ permission: 'allow' }, null, 2));
+    return;
+  }
+  if (!looksLikeWrite(payload)) {
+    console.log(JSON.stringify({ permission: 'allow' }, null, 2));
+    return;
+  }
+
+  const target = relativeTarget(extractTarget(payload), root);
+  if (!target || target === '.scope.json') {
+    console.log(JSON.stringify({ permission: 'allow' }, null, 2));
+    return;
+  }
+
+  const scope = loadScope(scopePath);
+  if (!scope) {
+    console.log(JSON.stringify({ permission: 'allow' }, null, 2));
+    return;
+  }
+
+  const missing = availableFields(scope.intent, scope.decomposition, scope.files);
+  if (missing.includes('intent')) {
+    console.log(JSON.stringify({
+      permission: 'deny',
+      agent_message: 'Denied until Step 0 is complete: fill `.scope.json` `intent` before any code edit.',
+      user_message: 'Step 0 missing: `.scope.json` has empty `intent`. Restate the task there, then continue.'
+    }, null, 2));
+    return;
+  }
+  if (missing.includes('decomposition')) {
+    console.log(JSON.stringify({
+      permission: 'deny',
+      agent_message: 'Denied: this multi-file change needs a declared `decomposition[]` in `.scope.json`.',
+      user_message: 'Add `decomposition[]` to `.scope.json` before editing a second file.'
+    }, null, 2));
+    return;
+  }
+
+  console.log(JSON.stringify({ permission: 'allow' }, null, 2));
+}
+
+(async () => {
+  await main();
+})();

@@ -1,18 +1,25 @@
-import { readFileSync, existsSync } from 'node:fs';
-import { join } from 'node:path';
-import { HOOKS_DIR, homeDir, readHookStdinJson, runHookMain } from './hook-common.mjs';
-import { writeSessionStartStamp } from './session-state.mjs';
+#!/usr/bin/env node
 
-export function run(obj) {
-  if (obj && typeof obj === 'object') writeSessionStartStamp(obj);
+import { existsSync, readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-  const override = join(homeDir(), '.cursor', 'doctrine.md');
-  const doctrinePath = existsSync(override) ? override : join(HOOKS_DIR, 'doctrine.md');
-  if (!existsSync(doctrinePath)) return {};
+const HOOKS_DIR = dirname(fileURLToPath(import.meta.url));
+const DOCTRINE_PATH = join(HOOKS_DIR, 'doctrine.md');
 
-  const content = readFileSync(doctrinePath, 'utf8').trim();
-  if (!content) return {};
-  return { additional_context: content };
+function main() {
+  try {
+    const doctrine = existsSync(DOCTRINE_PATH)
+      ? readFileSync(DOCTRINE_PATH, 'utf8').trim()
+      : '';
+    if (!doctrine) {
+      console.log('{}');
+      return;
+    }
+    console.log(JSON.stringify({ additional_context: doctrine }, null, 2));
+  } catch {
+    console.log('{}');
+  }
 }
 
-runHookMain(run, import.meta.url);
+main();
