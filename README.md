@@ -1,11 +1,11 @@
-# cursordoctrine lite
+# cursordoctrine
 
-Ten agent hooks were nice. Four lite hooks are enough.
+A focused Cursor hook pack: doctrine at session start, Step 0 hard gate on writes, shell deny-list without force-push, and one final review at stop.
 
-This pack covers the actual leverage points without the scope-tracking tax:
-- doctrine at session start
-- Step 0 hard gate on writes
-- shell deny-list without force-push
-- one final review at stop
+What you get:
+- `~/.agents/hooks/` with four hooks copied from `hooks/`
+- `~/.cursor/hooks.json` wiring the canonical event set
+- `GLOBAL-RULES.md` as the lightweight governing text
+- `HOOKS.md` for the hook reference
 
-Everything else was overhead.
+Ponytail philosophy applies: minimality over cleverness, deletion over addition, boring implementations over novelty.

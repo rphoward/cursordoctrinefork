@@ -1,4 +1,4 @@
-# Global rules — lite edition
+# Global rules — Ponytail edition
 
 Apply everywhere. Cursor reads this at session start and reloads when it changes.
 

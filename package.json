@@ -1,15 +1,15 @@
 {
-  "name": "cursordoctrine-lite",
+  "name": "cursordoctrine",
   "version": "3.0.0",
-  "description": "Cursor hook pack lite: doctrine at session start, Step 0 hard gate on writes, shell deny-list without force-push, one final review at stop.",
-  "bin": {
-    "cursordoctrine": "bin/cli.mjs"
-  },
+  "description": "Cursor hook pack: doctrine at session start, Step 0 hard gate on writes, shell deny-list without force-push, one final review at stop.",
+  "main": "bin/cli.mjs",
   "type": "module",
+  "bin": {
+    "cursordoctrine": "./bin/cli.mjs"
+  },
   "scripts": {
-    "test": "node bin/cli.mjs verify",
-    "verify": "node bin/cli.mjs verify",
     "install": "node bin/cli.mjs install",
+    "verify": "node bin/cli.mjs verify",
     "uninstall": "node bin/cli.mjs uninstall"
   },
   "engines": {
@@ -19,32 +19,23 @@
     "bin/",
     "hooks/",
     "hooks.json",
-    "docs/",
+    "GLOBAL-RULES.md",
+    "HOOKS.md",
     "INSTALL.md",
     "README.md",
-    "HOOKS.md",
-    "GLOBAL-RULES.md",
-    "!**/__pycache__",
-    "!**/*.pyc",
-    "!**/*.pyo"
+    "LICENSE"
   ],
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/kleosr/cursordoctrine.git"
-  },
-  "homepage": "https://github.com/kleosr/cursordoctrine#readme",
-  "bugs": {
-    "url": "https://github.com/kleosr/cursordoctrine/issues"
-  },
   "keywords": [
     "cursor",
-    "cursor-hooks",
     "hooks",
     "agent",
-    "ai-agents",
-    "self-review",
-    "code-review"
+    "ponytail",
+    "doctrine",
+    "step0"
   ],
-  "author": "Mario Pulice (kleosr)",
-  "license": "MIT"
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kleosr/cursordoctrine.git"
+  }
 }

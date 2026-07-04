@@ -30,7 +30,7 @@ function rmBestEffort(path) {
 }
 
 function install() {
-  console.log(`cursordoctrine ${pkg.version} — installing lite pack into ${HOME}`);
+  console.log(`cursordoctrine ${pkg.version} — installing into ${HOME}`);
 
   mkdirSync(hooksDst, { recursive: true });
   mkdirSync(cursorDst, { recursive: true });
@@ -50,7 +50,7 @@ function install() {
 }
 
 function uninstall() {
-  console.log(`cursordoctrine ${pkg.version} — removing lite pack from ${HOME}`);
+  console.log(`cursordoctrine ${pkg.version} — removing from ${HOME}`);
   const removed = [];
   const shipped = readdirSync(hooksSrc).filter((f) => !f.startsWith('__pycache__'));
   for (const f of shipped) {
@@ -80,7 +80,7 @@ function runHook(file, payloadObj) {
 }
 
 function verify() {
-  console.log(`cursordoctrine ${pkg.version} — verifying lite pack`);
+  console.log(`cursordoctrine ${pkg.version} — verifying hook pack`);
   console.log('');
 
   const checks = [
@@ -145,7 +145,7 @@ function verify() {
 }
 
 function help() {
-  console.log(`cursordoctrine ${pkg.version} — lite Cursor hooks\n\nUsage\n  npx cursordoctrine <command>\n\nCommands\n  install    Copy lite hook engine into ~/.agents/hooks and merge hooks.json.\n  verify     Smoke-test the installed lite pack.\n  uninstall  Remove installed files and strip hooks.json.\n  help       Show this help.\n`);
+  console.log(`cursordoctrine ${pkg.version} — Cursor hooks\n\nUsage\n  npx cursordoctrine <command>\n\nCommands\n  install    Copy hook engine into ~/.agents/hooks and merge hooks.json.\n  verify     Smoke-test the installed pack.\n  uninstall  Remove installed files and strip hooks.json.\n  help       Show this help.\n`);
 }
 
 const cmd = (process.argv[2] || 'help').toLowerCase();
