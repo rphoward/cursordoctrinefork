@@ -80,14 +80,17 @@ function runHook(file, payloadObj) {
 }
 
 function verify() {
-  console.log(`cursordoctrine ${pkg.version} — verifying hook pack`);
+  console.log(`cursordoctrine ${pkg.version} — verifying hook pack (source: hooks/)`);
   console.log('');
+
+  const scopePath = join(pkgRoot, '.scope.json');
+  const scopeBackup = existsSync(scopePath) ? readFileSync(scopePath, 'utf8') : null;
 
   const checks = [
     {
-      name: 'inject-doctrine-noop-with-empty-stdin',
+      name: 'inject-doctrine-injects-content',
       run() {
-        const r = runHook(join(hooksDst, 'inject-doctrine.mjs'), {});
+        const r = runHook(join(hooksSrc, 'inject-doctrine.mjs'), {});
         const json = JSON.parse(r || '{}');
         return json.additional_context ? 'ok' : false;
       }
@@ -95,15 +98,28 @@ function verify() {
     {
       name: 'step0-gate-allows-reads',
       run() {
-        const r = runHook(join(hooksDst, 'step0-gate.mjs'), { tool_name: 'Read', cwd: process.cwd() });
+        const r = runHook(join(hooksSrc, 'step0-gate.mjs'), { tool_name: 'Read', cwd: pkgRoot });
         const json = JSON.parse(r || '{}');
         return json.permission === 'allow' ? 'ok' : false;
       }
     },
     {
+      name: 'step0-gate-denies-write-without-intent',
+      run() {
+        writeFileSync(scopePath, JSON.stringify({ intent: '', decomposition: [], files: [] }, null, 2) + '\n');
+        const r = runHook(join(hooksSrc, 'step0-gate.mjs'), {
+          tool_name: 'Write',
+          file_path: join(pkgRoot, 'probe.txt'),
+          cwd: pkgRoot,
+        });
+        const json = JSON.parse(r || '{}');
+        return json.permission === 'deny' ? 'ok' : false;
+      }
+    },
+    {
       name: 'permission-gate-denies-force-push',
       run() {
-        const r = runHook(join(hooksDst, 'permission-gate.mjs'), { command: 'git push --force' });
+        const r = runHook(join(hooksSrc, 'permission-gate.mjs'), { command: 'git push --force' });
         const json = JSON.parse(r || '{}');
         return json.permission === 'deny' ? 'ok' : false;
       }
@@ -111,7 +127,7 @@ function verify() {
     {
       name: 'permission-gate-allows-status',
       run() {
-        const r = runHook(join(hooksDst, 'permission-gate.mjs'), { command: 'git status' });
+        const r = runHook(join(hooksSrc, 'permission-gate.mjs'), { command: 'git status' });
         const json = JSON.parse(r || '{}');
         return json.permission === 'allow' ? 'ok' : false;
       }
@@ -119,7 +135,7 @@ function verify() {
     {
       name: 'final-review-emits-followup-on-completed',
       run() {
-        const r = runHook(join(hooksDst, 'final-review.mjs'), { status: 'completed', cwd: process.cwd() });
+        const r = runHook(join(hooksSrc, 'final-review.mjs'), { status: 'completed', cwd: pkgRoot });
         const json = JSON.parse(r || '{}');
         return typeof json.followup_message === 'string' && json.followup_message.includes('FINAL REVIEW') ? 'ok' : false;
       }
@@ -140,8 +156,11 @@ function verify() {
   }
   console.log('');
   console.log(`  ${checks.length} check(s): ${passed} ok, ${failed} failed`);
-  if (failed) { console.error(`${failed} check(s) failed. Re-run: npx cursordoctrine install`); process.exit(1); }
-  console.log('All checks passed. Restart Cursor if you have not since installing.');
+  if (scopeBackup !== null) writeFileSync(scopePath, scopeBackup);
+  else if (existsSync(scopePath)) rmSync(scopePath, { force: true });
+
+  if (failed) { console.error(`${failed} check(s) failed.`); process.exit(1); }
+  console.log('All checks passed.');
 }
 
 function help() {

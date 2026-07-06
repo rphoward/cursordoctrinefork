@@ -9,7 +9,7 @@ const HOOKS_DIR = dirname(fileURLToPath(import.meta.url));
 function resolveProjectRoot(cwd, workspaceRoots) {
   const tries = [
     cwd,
-    ...(Array.isArray(workspaceRoots) ? workspaceRoots : Array.isArray(workspaceRoots) ? workspaceRoots : []).filter(Boolean),
+    ...(Array.isArray(workspaceRoots) ? workspaceRoots : []).filter(Boolean),
     process.env.CURSOR_PROJECT_DIR || '',
     process.env.PWD || ''
   ];
@@ -69,7 +69,7 @@ async function readInput() {
 }
 
 async function main() {
-  const payload = readInput();
+  const payload = await readInput();
   if (process.env.STEP0_GATE_ENFORCE === '0') {
     console.log(JSON.stringify({ permission: 'allow' }, null, 2));
     return;

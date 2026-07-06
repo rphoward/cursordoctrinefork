@@ -1,3 +1,5 @@
+#!/usr/bin/env node
+
 const DENY_RE = /\b(rm\s+-rf\s+\/|curl\s*\|\s*(bash|sh|zsh|fish|powershell|pwsh)|wget\s*\|\s*(bash|sh|zsh|fish)|git\s+push\s+--force|git\s+push\s+-f|git\s+reset\s+--hard|git\s+clean\s+-fd|npm\s+publish|pnpm\s+publish|yarn\s+publish|npx\s+.*\s+publish|dd\s+.*\s+\/dev\/(zero|random|urandom)|mkfs\.|chmod\s+-R\s+\/|chown\s+-R\s+\/)\b/i;
 
 async function readInput() {
@@ -17,29 +19,21 @@ function decision(command) {
 (async () => {
   if (process.env.PERM_GATE_ENFORCE === '0') {
     console.log(JSON.stringify({ permission: 'allow' }, null, 2));
-    process.exit(0);
+    return;
   }
 
-  const chunks = [];
-  for await (const chunk of process.stdin) chunks.push(chunk);
-  const raw = Buffer.concat(chunks).toString('utf8').trim();
-  let payload = {};
-  if (raw) {
-    try { payload = JSON.parse(raw); } catch { /* noop */ }
-  }
-
-  const fromStdin = JSON.parse(raw || '{}');
-  const shell = payload.shell || {};
-  const command = (fromStdin.command || shell.command || '').trim();
+  const payload = await readInput();
+  const command = (payload.command || payload.shell?.command || '').trim();
   const result = decision(command);
 
   if (result === 'allow') {
     console.log(JSON.stringify({ permission: 'allow' }, null, 2));
-  } else {
-    console.log(JSON.stringify({
-      permission: 'deny',
-      user_message: 'Blocked shell command: `' + command + '`.',
-      agent_message: 'Blocked shell command: `' + command + '`.'
-    }, null, 2));
+    return;
   }
+
+  console.log(JSON.stringify({
+    permission: 'deny',
+    user_message: 'Blocked shell command: `' + command + '`.',
+    agent_message: 'Blocked shell command: `' + command + '`.'
+  }, null, 2));
 })();
